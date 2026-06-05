@@ -225,6 +225,9 @@ func InitConfig(params InitParams, fsys afero.Fs) error {
 	if params.UseOrioleDB {
 		c.Experimental.OrioleDBVersion = "15.1.0.150"
 	}
+	// Newly generated projects opt into pg-delta. Existing configs are unaffected
+	// because mergeDefaultValues ejects with this flag false (default stays migra).
+	c.Experimental.PgDeltaInitEnabled = true
 	// Create config file
 	if err := MkdirIfNotExistFS(fsys, SupabaseDirPath); err != nil {
 		return err
