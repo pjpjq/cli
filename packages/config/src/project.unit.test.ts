@@ -5,15 +5,19 @@ import { mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Effect, FileSystem, Path, Redacted } from "effect";
-import { findProjectRootFor, loadProjectEnvironmentFor } from "./bun.ts";
-import { ProjectConfigParseError } from "./errors.ts";
 import {
-  findProjectPaths,
-  loadProjectConfig,
-  loadProjectEnvironment,
-  resolveProjectSubtree,
-  resolveProjectValue,
-} from "./index.ts";
+  findCliProjectRoot as findCliProjectRootFromBun,
+  loadCliProjectEnvironment as loadCliProjectEnvironmentFromBun,
+} from "./bun.ts";
+import { CliConfigParseError, CliProjectEnvParseError } from "./errors.ts";
+import {
+  findCliProjectPaths,
+  loadCliConfig,
+  loadCliProjectEnvironment,
+  resolveCliConfigSubtree,
+  resolveCliConfigValue,
+} from "./effect.ts";
+import { resolveCliConfigValue as resolveCliConfigValueInternal } from "./internal.ts";
 
 function makeTempProject(): string {
   return mkdtempSync(join(tmpdir(), "supabase-project-config-"));
@@ -39,12 +43,79 @@ describe("project discovery and lazy env resolution", () => {
       await writeFile(join(repoRoot, "supabase", "config.toml"), 'project_id = "repo"\n');
       await writeFile(join(packageRoot, "supabase", "config.toml"), 'project_id = "web"\n');
 
-      const paths = await runConfigEffect(findProjectPaths(nestedCwd));
+      const paths = await runConfigEffect(findCliProjectPaths(nestedCwd));
 
       expect(paths?.projectRoot).toBe(packageRoot);
       expect(paths?.supabaseDir).toBe(join(packageRoot, "supabase"));
       expect(paths?.configPath).toBe(join(packageRoot, "supabase", "config.toml"));
-      expect(await findProjectRootFor(nestedCwd)).toBe(packageRoot);
+      expect(await findCliProjectRootFromBun(nestedCwd)).toBe(packageRoot);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("search: false only checks cwd itself, matching Go's exact-workdir resolution", async () => {
+    const cwd = makeTempProject();
+    const repoRoot = join(cwd, "repo");
+    const packageRoot = join(repoRoot, "apps", "web");
+    const nestedCwd = join(packageRoot, "src", "components");
+
+    try {
+      await mkdir(join(repoRoot, "supabase"), { recursive: true });
+      await mkdir(nestedCwd, { recursive: true });
+      await writeFile(join(repoRoot, "supabase", "config.toml"), 'project_id = "repo"\n');
+
+      // nestedCwd has no supabase/ of its own; only an ancestor (repoRoot) does.
+      const searched = await runConfigEffect(findCliProjectPaths(nestedCwd));
+      expect(searched?.projectRoot).toBe(repoRoot);
+
+      const unsearched = await runConfigEffect(findCliProjectPaths(nestedCwd, { search: false }));
+      expect(unsearched).toBeNull();
+
+      const configAtRepoRoot = await runConfigEffect(
+        findCliProjectPaths(repoRoot, { search: false }),
+      );
+      expect(configAtRepoRoot?.projectRoot).toBe(repoRoot);
+
+      expect(await runConfigEffect(loadCliConfig(nestedCwd, { search: false }))).toBeNull();
+      expect(
+        await runConfigEffect(loadCliProjectEnvironment({ cwd: nestedCwd, search: false })),
+      ).toBeNull();
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("climbs past a FILE named `supabase` in the starting directory instead of failing with ENOTDIR", async () => {
+    const cwd = makeTempProject();
+    const nestedCwd = join(cwd, "child");
+
+    try {
+      await mkdir(nestedCwd, { recursive: true });
+      await writeFile(join(nestedCwd, "supabase"), "not a directory\n");
+
+      const paths = await runConfigEffect(findCliProjectPaths(nestedCwd));
+
+      expect(paths).toBeNull();
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("returns the parent's project when the starting directory has a FILE named `supabase` but the parent has a real config", async () => {
+    const cwd = makeTempProject();
+    const child = join(cwd, "child");
+
+    try {
+      await mkdir(join(cwd, "supabase"), { recursive: true });
+      await mkdir(child, { recursive: true });
+      await writeFile(join(cwd, "supabase", "config.toml"), 'project_id = "parent"\n');
+      await writeFile(join(child, "supabase"), "not a directory\n");
+
+      const paths = await runConfigEffect(findCliProjectPaths(child));
+
+      expect(paths?.projectRoot).toBe(cwd);
+      expect(paths?.configPath).toBe(join(cwd, "supabase", "config.toml"));
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -73,7 +144,7 @@ describe("project discovery and lazy env resolution", () => {
       );
 
       const projectEnv = await runConfigEffect(
-        loadProjectEnvironment({
+        loadCliProjectEnvironment({
           cwd: nestedCwd,
           baseEnv: {
             OVERRIDE_ME: "from-ambient",
@@ -94,7 +165,7 @@ describe("project discovery and lazy env resolution", () => {
         join(packageRoot, "supabase", ".env.local"),
       ]);
 
-      const fromBun = await loadProjectEnvironmentFor({
+      const fromBun = await loadCliProjectEnvironmentFromBun({
         cwd: nestedCwd,
         baseEnv: {
           OVERRIDE_ME: "from-ambient",
@@ -102,6 +173,102 @@ describe("project discovery and lazy env resolution", () => {
       });
 
       expect(fromBun?.paths.projectRoot).toBe(packageRoot);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("parses a multiline double-quoted .env value (godotenv/Go parity)", async () => {
+    const cwd = makeTempProject();
+
+    try {
+      await mkdir(join(cwd, "supabase"), { recursive: true });
+      await writeFile(join(cwd, "supabase", "config.toml"), 'project_id = "ref_123"\n');
+      await writeFile(
+        join(cwd, "supabase", ".env"),
+        [
+          'PRIVATE_KEY="-----BEGIN RSA PRIVATE KEY-----',
+          "MIIEpAIBAAKCAQEA1c7+9z5Pad7OejecsQ0bu3aumga",
+          '-----END RSA PRIVATE KEY-----"',
+          "OTHER=value",
+          "",
+        ].join("\n"),
+      );
+
+      const projectEnv = await runConfigEffect(loadCliProjectEnvironment({ cwd }));
+
+      expect(projectEnv).not.toBeNull();
+      expect(projectEnv?.values.PRIVATE_KEY).toBe(
+        [
+          "-----BEGIN RSA PRIVATE KEY-----",
+          "MIIEpAIBAAKCAQEA1c7+9z5Pad7OejecsQ0bu3aumga",
+          "-----END RSA PRIVATE KEY-----",
+        ].join("\n"),
+      );
+      expect(projectEnv?.values.OTHER).toBe("value");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("parses a multiline single-quoted .env value followed by a trailing comment", async () => {
+    const cwd = makeTempProject();
+
+    try {
+      await mkdir(join(cwd, "supabase"), { recursive: true });
+      await writeFile(join(cwd, "supabase", "config.toml"), 'project_id = "ref_123"\n');
+      await writeFile(
+        join(cwd, "supabase", ".env"),
+        ["MULTI='line one", "line two' # trailing comment", "AFTER=ok", ""].join("\n"),
+      );
+
+      const projectEnv = await runConfigEffect(loadCliProjectEnvironment({ cwd }));
+
+      expect(projectEnv).not.toBeNull();
+      expect(projectEnv?.values.MULTI).toBe(["line one", "line two"].join("\n"));
+      expect(projectEnv?.values.AFTER).toBe("ok");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("still fails a genuinely malformed .env line (not a multiline quote)", async () => {
+    const cwd = makeTempProject();
+
+    try {
+      await mkdir(join(cwd, "supabase"), { recursive: true });
+      await writeFile(join(cwd, "supabase", "config.toml"), 'project_id = "ref_123"\n');
+      await writeFile(join(cwd, "supabase", ".env"), "!!!not-a-valid-line\n");
+
+      await expect(runConfigEffect(loadCliProjectEnvironment({ cwd }))).rejects.toBeInstanceOf(
+        CliProjectEnvParseError,
+      );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("skipEnvLocal ignores .env.local entirely, matching Go's SUPABASE_ENV=test gate", async () => {
+    const cwd = makeTempProject();
+
+    try {
+      await mkdir(join(cwd, "supabase"), { recursive: true });
+      await writeFile(join(cwd, "supabase", "config.toml"), 'project_id = "ref_123"\n');
+      await writeFile(join(cwd, "supabase", ".env"), "FROM_ENV=1\n");
+      // Malformed — would normally throw CliProjectEnvParseError.
+      await writeFile(join(cwd, "supabase", ".env.local"), "!!!not-a-valid-line\n");
+
+      const projectEnv = await runConfigEffect(
+        loadCliProjectEnvironment({ cwd, skipEnvLocal: true }),
+      );
+
+      expect(projectEnv).not.toBeNull();
+      expect(projectEnv?.values.FROM_ENV).toBe("1");
+      expect(projectEnv?.loadedPaths).toEqual([join(cwd, "supabase", ".env")]);
+
+      await expect(runConfigEffect(loadCliProjectEnvironment({ cwd }))).rejects.toBeInstanceOf(
+        CliProjectEnvParseError,
+      );
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -115,23 +282,21 @@ describe("project discovery and lazy env resolution", () => {
       await mkdir(join(projectRoot, "supabase"), { recursive: true });
       await writeFile(join(projectRoot, "supabase", "config.toml"), `project_id = "ref_123"\n`);
 
-      const defaultLoaded = await runConfigEffect(loadProjectConfig(projectRoot));
-      // Field is intentionally optional today so the implicit default can flip on 2026-05-30
-      // without losing track of users who explicitly opted in either direction.
+      const defaultLoaded = await runConfigEffect(loadCliConfig(projectRoot));
       expect(defaultLoaded!.config.api.auto_expose_new_tables).toBeUndefined();
 
       await writeFile(
         join(projectRoot, "supabase", "config.toml"),
         `project_id = "ref_123"\n\n[api]\nauto_expose_new_tables = false\n`,
       );
-      const explicitFalse = await runConfigEffect(loadProjectConfig(projectRoot));
+      const explicitFalse = await runConfigEffect(loadCliConfig(projectRoot));
       expect(explicitFalse!.config.api.auto_expose_new_tables).toBe(false);
 
       await writeFile(
         join(projectRoot, "supabase", "config.toml"),
         `project_id = "ref_123"\n\n[api]\nauto_expose_new_tables = true\n`,
       );
-      const explicitTrue = await runConfigEffect(loadProjectConfig(projectRoot));
+      const explicitTrue = await runConfigEffect(loadCliConfig(projectRoot));
       expect(explicitTrue!.config.api.auto_expose_new_tables).toBe(true);
     } finally {
       await rm(cwd, { recursive: true, force: true });
@@ -157,8 +322,8 @@ auth_token = "env(TWILIO_AUTH_TOKEN)"
 `,
       );
 
-      const loaded = await runConfigEffect(loadProjectConfig(projectRoot));
-      const projectEnv = await runConfigEffect(loadProjectEnvironment({ cwd: projectRoot }));
+      const loaded = await runConfigEffect(loadCliConfig(projectRoot));
+      const projectEnv = await runConfigEffect(loadCliProjectEnvironment({ cwd: projectRoot }));
 
       expect(loaded!.config.auth.jwt_secret).toBe("env(AUTH_JWT_SECRET)");
       expect(loaded!.config.auth.sms.twilio.auth_token).toBe("env(TWILIO_AUTH_TOKEN)");
@@ -168,7 +333,7 @@ auth_token = "env(TWILIO_AUTH_TOKEN)"
     }
   });
 
-  test("resolveProjectValue resolves explicit env() and redacts secret leaves", async () => {
+  test("resolveCliConfigValue resolves explicit env() and redacts secret leaves", async () => {
     const cwd = makeTempProject();
     const projectRoot = join(cwd, "repo");
 
@@ -184,11 +349,11 @@ jwt_secret = "env(AUTH_JWT_SECRET)"
       );
       await writeFile(join(projectRoot, "supabase", ".env"), "AUTH_JWT_SECRET=super-secret\n");
 
-      const loaded = await runConfigEffect(loadProjectConfig(projectRoot));
-      const projectEnv = await runConfigEffect(loadProjectEnvironment({ cwd: projectRoot }));
+      const loaded = await runConfigEffect(loadCliConfig(projectRoot));
+      const projectEnv = await runConfigEffect(loadCliProjectEnvironment({ cwd: projectRoot }));
 
       const resolved = await runConfigEffect(
-        resolveProjectValue(loaded!.config.auth.jwt_secret, projectEnv!, "auth.jwt_secret"),
+        resolveCliConfigValue(loaded!.config.auth.jwt_secret, projectEnv!, "auth.jwt_secret"),
       );
 
       expect(Redacted.isRedacted(resolved)).toBe(true);
@@ -201,7 +366,7 @@ jwt_secret = "env(AUTH_JWT_SECRET)"
     }
   });
 
-  test("resolveProjectSubtree resolves nested records and remotes lazily", async () => {
+  test("resolveCliConfigSubtree resolves nested records and remotes lazily", async () => {
     const cwd = makeTempProject();
     const projectRoot = join(cwd, "repo");
 
@@ -214,6 +379,9 @@ jwt_secret = "env(AUTH_JWT_SECRET)"
 [edge_runtime.secrets]
 api_key = "env(EDGE_API_KEY)"
 
+[remotes.preview]
+project_id = "previewrefaaaaaaaaaa"
+
 [remotes.preview.auth]
 jwt_secret = "env(PREVIEW_JWT_SECRET)"
 `,
@@ -223,14 +391,14 @@ jwt_secret = "env(PREVIEW_JWT_SECRET)"
         "EDGE_API_KEY=edge-secret\nPREVIEW_JWT_SECRET=preview-secret\n",
       );
 
-      const loaded = await runConfigEffect(loadProjectConfig(projectRoot));
-      const projectEnv = await runConfigEffect(loadProjectEnvironment({ cwd: projectRoot }));
+      const loaded = await runConfigEffect(loadCliConfig(projectRoot));
+      const projectEnv = await runConfigEffect(loadCliProjectEnvironment({ cwd: projectRoot }));
 
       const edgeRuntime = await runConfigEffect(
-        resolveProjectSubtree(loaded!.config.edge_runtime, projectEnv!, "edge_runtime"),
+        resolveCliConfigSubtree(loaded!.config.edge_runtime, projectEnv!, "edge_runtime"),
       );
       const previewRemote = await runConfigEffect(
-        resolveProjectSubtree(loaded!.config.remotes.preview, projectEnv!, "remotes.preview"),
+        resolveCliConfigSubtree(loaded!.config.remotes.preview, projectEnv!, "remotes.preview"),
       );
 
       const edgeSecret = edgeRuntime.secrets?.api_key;
@@ -251,7 +419,7 @@ jwt_secret = "env(PREVIEW_JWT_SECRET)"
     }
   });
 
-  test("resolveProjectValue preserves env() literal when the env var is missing (Go parity)", async () => {
+  test("resolveCliConfigValue preserves env() literal when the env var is missing (Go parity)", async () => {
     const cwd = makeTempProject();
     const projectRoot = join(cwd, "repo");
 
@@ -266,15 +434,13 @@ jwt_secret = "env(MISSING_SECRET)"
 `,
       );
 
-      const loaded = await runConfigEffect(loadProjectConfig(projectRoot));
-      const projectEnv = await runConfigEffect(loadProjectEnvironment({ cwd: projectRoot }));
+      const loaded = await runConfigEffect(loadCliConfig(projectRoot));
+      const projectEnv = await runConfigEffect(loadCliProjectEnvironment({ cwd: projectRoot }));
 
       const resolved = await runConfigEffect(
-        resolveProjectValue(loaded!.config.auth.jwt_secret, projectEnv!, "auth.jwt_secret"),
+        resolveCliConfigValue(loaded!.config.auth.jwt_secret, projectEnv!, "auth.jwt_secret"),
       );
 
-      // Secret paths are normally redacted, but unresolved env() literals pass
-      // through as plain strings so callers can see the missing reference.
       expect(Redacted.isRedacted(resolved)).toBe(false);
       expect(resolved).toBe("env(MISSING_SECRET)");
     } finally {
@@ -282,7 +448,41 @@ jwt_secret = "env(MISSING_SECRET)"
     }
   });
 
-  test("resolveProjectSubtree preserves env() literals nested inside the selected subtree", async () => {
+  test("resolveCliConfigValue preserves env() literal when the env var is present but empty (Go parity)", async () => {
+    const cwd = makeTempProject();
+    const projectRoot = join(cwd, "repo");
+
+    try {
+      await mkdir(join(projectRoot, "supabase"), { recursive: true });
+      await writeFile(
+        join(projectRoot, "supabase", "config.toml"),
+        `project_id = "ref_123"
+
+[edge_runtime.secrets]
+foo = "env(EMPTY_SECRET)"
+`,
+      );
+      await writeFile(join(projectRoot, "supabase", ".env"), "EMPTY_SECRET=\n");
+
+      const loaded = await runConfigEffect(loadCliConfig(projectRoot));
+      const projectEnv = await runConfigEffect(loadCliProjectEnvironment({ cwd: projectRoot }));
+
+      const resolved = await runConfigEffect(
+        resolveCliConfigValue(
+          loaded!.config.edge_runtime.secrets!.foo,
+          projectEnv!,
+          "edge_runtime.secrets.foo",
+        ),
+      );
+
+      expect(Redacted.isRedacted(resolved)).toBe(false);
+      expect(resolved).toBe("env(EMPTY_SECRET)");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("resolveCliConfigSubtree preserves env() literals nested inside the selected subtree", async () => {
     const cwd = makeTempProject();
     const projectRoot = join(cwd, "repo");
 
@@ -298,11 +498,11 @@ auth_token = "env(MISSING_SECRET)"
 `,
       );
 
-      const loaded = await runConfigEffect(loadProjectConfig(projectRoot));
-      const projectEnv = await runConfigEffect(loadProjectEnvironment({ cwd: projectRoot }));
+      const loaded = await runConfigEffect(loadCliConfig(projectRoot));
+      const projectEnv = await runConfigEffect(loadCliProjectEnvironment({ cwd: projectRoot }));
 
       const resolved = await runConfigEffect(
-        resolveProjectSubtree(loaded!.config.auth.sms.twilio, projectEnv!, "auth.sms.twilio"),
+        resolveCliConfigSubtree(loaded!.config.auth.sms.twilio, projectEnv!, "auth.sms.twilio"),
       );
 
       expect(resolved.auth_token).toBe("env(MISSING_SECRET)");
@@ -327,9 +527,80 @@ account_sid = "AC123"
 `,
       );
 
-      await expect(runConfigEffect(loadProjectConfig(projectRoot))).rejects.toBeInstanceOf(
-        ProjectConfigParseError,
+      await expect(runConfigEffect(loadCliConfig(projectRoot))).rejects.toBeInstanceOf(
+        CliConfigParseError,
       );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("resolveCliConfigValue does not resolve a lowercase-named env() reference by default", async () => {
+    const cwd = makeTempProject();
+    const projectRoot = join(cwd, "repo");
+
+    try {
+      await mkdir(join(projectRoot, "supabase"), { recursive: true });
+      await writeFile(
+        join(projectRoot, "supabase", "config.toml"),
+        `project_id = "ref_123"
+
+[auth]
+jwt_secret = "env(lowercase_secret)"
+`,
+      );
+      await writeFile(join(projectRoot, "supabase", ".env"), "lowercase_secret=super-secret\n");
+
+      const loaded = await runConfigEffect(loadCliConfig(projectRoot));
+      const projectEnv = await runConfigEffect(loadCliProjectEnvironment({ cwd: projectRoot }));
+
+      const resolved = await runConfigEffect(
+        resolveCliConfigValue(loaded!.config.auth.jwt_secret, projectEnv!, "auth.jwt_secret"),
+      );
+
+      expect(Redacted.isRedacted(resolved)).toBe(true);
+      if (!Redacted.isRedacted(resolved)) {
+        throw new Error("Expected auth.jwt_secret to be redacted.");
+      }
+      expect(Redacted.value(resolved)).toBe("env(lowercase_secret)");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("resolveCliConfigValue resolves a lowercase-named env() reference when goViperCompat is true", async () => {
+    const cwd = makeTempProject();
+    const projectRoot = join(cwd, "repo");
+
+    try {
+      await mkdir(join(projectRoot, "supabase"), { recursive: true });
+      await writeFile(
+        join(projectRoot, "supabase", "config.toml"),
+        `project_id = "ref_123"
+
+[auth]
+jwt_secret = "env(lowercase_secret)"
+`,
+      );
+      await writeFile(join(projectRoot, "supabase", ".env"), "lowercase_secret=super-secret\n");
+
+      const loaded = await runConfigEffect(loadCliConfig(projectRoot));
+      const projectEnv = await runConfigEffect(loadCliProjectEnvironment({ cwd: projectRoot }));
+
+      const resolved = await runConfigEffect(
+        resolveCliConfigValueInternal(
+          loaded!.config.auth.jwt_secret,
+          projectEnv!,
+          "auth.jwt_secret",
+          { goViperCompat: true },
+        ),
+      );
+
+      expect(Redacted.isRedacted(resolved)).toBe(true);
+      if (!Redacted.isRedacted(resolved)) {
+        throw new Error("Expected auth.jwt_secret to be redacted.");
+      }
+      expect(Redacted.value(resolved)).toBe("super-secret");
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

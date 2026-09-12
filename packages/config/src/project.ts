@@ -1,35 +1,21 @@
-import { Effect, FileSystem, Redacted } from "effect";
-import { ProjectConfigSchema } from "./base.ts";
-import { ProjectEnvParseError } from "./errors.ts";
-import { ENV_CAPTURE_REGEX, isEnvReference } from "./lib/env.ts";
-import { findProjectPaths, type ProjectPaths } from "./paths.ts";
+import { Effect, FileSystem } from "effect";
+import { CliProjectEnvParseError } from "./errors.ts";
+import {
+  resolveCliConfigValueAtPath,
+  toPathSegments,
+  type ResolvedCliConfigValue,
+} from "./lib/resolve.ts";
+import { findCliProjectPaths, type CliProjectPaths } from "./paths.ts";
 
-const envReferencePattern = ENV_CAPTURE_REGEX;
 const dotEnvLinePattern =
   /^\s*(?:export\s+)?([\w.-]+)(?:\s*=\s*?|:\s+?)(\s*'(?:\\'|[^'])*'|\s*"(?:\\"|[^"])*"|\s*`(?:\\`|[^`])*`|[^#\r\n]+)?\s*(?:#.*)?$/;
 
-export interface ProjectEnvironment {
-  readonly paths: ProjectPaths;
+export interface CliProjectEnvironment {
+  readonly paths: CliProjectPaths;
   readonly values: Readonly<Record<string, string>>;
   readonly loadedPaths: ReadonlyArray<string>;
   readonly sources: Readonly<Record<string, "ambient" | ".env" | ".env.local">>;
 }
-
-type ResolvedString = string | Redacted.Redacted<string>;
-
-export type ResolvedProjectValue<T> = T extends string
-  ? ResolvedString
-  : T extends ReadonlyArray<infer U>
-    ? ReadonlyArray<ResolvedProjectValue<U>>
-    : T extends Array<infer U>
-      ? Array<ResolvedProjectValue<U>>
-      : T extends Record<string, infer V>
-        ? { readonly [K in keyof T]: ResolvedProjectValue<T[K]> } & {
-            readonly [key: string]: ResolvedProjectValue<V>;
-          }
-        : T extends object
-          ? { readonly [K in keyof T]: ResolvedProjectValue<T[K]> }
-          : T;
 
 function normalizeAmbientEnv(
   baseEnv: Readonly<Record<string, string | undefined>> | undefined,
@@ -43,6 +29,37 @@ function normalizeAmbientEnv(
   }
 
   return values;
+}
+
+// Matches a `KEY=<quote>` (or `KEY: <quote>`) opener, used to detect the start of a
+// multiline quoted value (e.g. a PEM block) that doesn't close on the same line.
+const dotEnvValueOpenerPattern = /^\s*(?:export\s+)?[\w.-]+(?:\s*=\s*?|:\s+?)(['"`])/;
+
+function findUnescapedQuoteIndex(text: string, quote: string, from: number): number {
+  for (let i = from; i < text.length; i += 1) {
+    if (text[i] === quote && text[i - 1] !== "\\") {
+      return i;
+    }
+  }
+  return -1;
+}
+
+function detectOpenQuoteStart(line: string): { quote: string; openIndex: number } | null {
+  const openerMatch = dotEnvValueOpenerPattern.exec(line);
+  if (openerMatch === null) {
+    return null;
+  }
+  const quote = openerMatch[1];
+  if (quote === undefined) {
+    return null;
+  }
+  const openIndex = openerMatch[0].length - 1;
+  if (findUnescapedQuoteIndex(line, quote, openIndex + 1) !== -1) {
+    // Already closes on this same line — this isn't the multiline case, so
+    // whatever made the outer match fail is a genuine parse error.
+    return null;
+  }
+  return { quote, openIndex };
 }
 
 function parseDotEnvValue(rawValue: string): string {
@@ -62,7 +79,7 @@ function parseDotEnvValue(rawValue: string): string {
 function parseDotEnv(
   path: string,
   contents: string,
-): Effect.Effect<Record<string, string>, ProjectEnvParseError> {
+): Effect.Effect<Record<string, string>, CliProjectEnvParseError> {
   return Effect.gen(function* () {
     const values: Record<string, string> = {};
     const lines = contents.replace(/\r\n?/g, "\n").split("\n");
@@ -78,25 +95,57 @@ function parseDotEnv(
         continue;
       }
 
-      const match = dotEnvLinePattern.exec(line);
+      let candidate = line;
+      let consumedThrough = index;
+
+      // Detect an unterminated quote before the single-line match: the pattern's unquoted
+      // fallback (`[^#\r\n]+`) would otherwise "succeed" with a truncated value instead of
+      // signaling a multiline value (e.g. a PEM block spanning several lines). Accumulate
+      // subsequent lines until the opened quote closes, then match the joined chunk.
+      const opener = detectOpenQuoteStart(line);
+      if (opener !== null) {
+        for (let next = index + 1; next < lines.length; next += 1) {
+          const nextLine = lines[next];
+          if (nextLine === undefined) {
+            continue;
+          }
+          candidate += "\n" + nextLine;
+          consumedThrough = next;
+          if (findUnescapedQuoteIndex(candidate, opener.quote, opener.openIndex + 1) !== -1) {
+            break;
+          }
+        }
+      }
+
+      const match = dotEnvLinePattern.exec(candidate);
 
       if (match === null) {
-        return yield* Effect.fail(new ProjectEnvParseError({ path, line: index + 1 }));
+        return yield* Effect.fail(new CliProjectEnvParseError({ path, line: index + 1 }));
       }
 
       const key = match[1];
       const rawValue = match[2] ?? "";
 
       if (key === undefined) {
-        return yield* Effect.fail(new ProjectEnvParseError({ path, line: index + 1 }));
+        return yield* Effect.fail(new CliProjectEnvParseError({ path, line: index + 1 }));
       }
 
       values[key] = parseDotEnvValue(rawValue);
+      index = consumedThrough;
     }
 
     return values;
   });
 }
+
+/** Parse one explicit dotenv file without applying ambient or project-local precedence. */
+export const loadDotEnvFile = Effect.fnUntraced(function* (path: string) {
+  const fs = yield* FileSystem.FileSystem;
+  if (!(yield* fs.exists(path))) {
+    return {};
+  }
+  return yield* parseDotEnv(path, yield* fs.readFileString(path));
+});
 
 function applySource(
   target: Record<string, string>,
@@ -110,16 +159,33 @@ function applySource(
   }
 }
 
-export interface LoadProjectEnvironmentOptions {
+export interface LoadCliProjectEnvironmentOptions {
   readonly cwd: string;
   readonly baseEnv?: Readonly<Record<string, string | undefined>>;
+  /** See {@link FindCliProjectPathsOptions.search}. */
+  readonly search?: boolean;
+  /**
+   * Skip reading/parsing `paths.envLocalPath` (`supabase/.env.local`) entirely, so a
+   * malformed or intentionally non-test `.env.local` cannot fail config loading. Defaults
+   * to `false`.
+   */
+  readonly skipEnvLocal?: boolean;
 }
 
-export const loadProjectEnvironment = Effect.fnUntraced(function* (
-  options: LoadProjectEnvironmentOptions,
+/** Not covered by semver — exported from `@supabase/config/internal` only. */
+export interface InternalResolveCliConfigOptions {
+  /**
+   * Opt into viper-style case-agnostic `env()` matching (`^env\((.*)\)$`). Defaults to
+   * `false`, which requires SCREAMING_SNAKE_CASE.
+   */
+  readonly goViperCompat?: boolean;
+}
+
+export const loadCliProjectEnvironment = Effect.fnUntraced(function* (
+  options: LoadCliProjectEnvironmentOptions,
 ) {
   const fs = yield* FileSystem.FileSystem;
-  const paths = yield* findProjectPaths(options.cwd);
+  const paths = yield* findCliProjectPaths(options.cwd, { search: options.search });
 
   if (paths === null) {
     return null;
@@ -136,7 +202,7 @@ export const loadProjectEnvironment = Effect.fnUntraced(function* (
     loadedPaths.push(paths.envPath);
   }
 
-  if (yield* fs.exists(paths.envLocalPath)) {
+  if (!options.skipEnvLocal && (yield* fs.exists(paths.envLocalPath))) {
     const contents = yield* fs.readFileString(paths.envLocalPath);
     const parsed = yield* parseDotEnv(paths.envLocalPath, contents);
     applySource(values, sources, parsed, ".env.local");
@@ -150,176 +216,45 @@ export const loadProjectEnvironment = Effect.fnUntraced(function* (
     values,
     loadedPaths,
     sources,
-  } satisfies ProjectEnvironment;
+  } satisfies CliProjectEnvironment;
 });
 
-function collectSecretPathPatterns(
-  node: {
-    readonly annotations?: Record<string, unknown>;
-    readonly propertySignatures?: ReadonlyArray<{
-      readonly name: string;
-      readonly type: unknown;
-    }>;
-    readonly indexSignatures?: ReadonlyArray<{
-      readonly type: unknown;
-    }>;
-  },
-  prefix: ReadonlyArray<string> = [],
-): Array<ReadonlyArray<string>> {
-  const patterns: Array<ReadonlyArray<string>> = [];
-
-  if (node.annotations?.["x-secret"] === true) {
-    patterns.push(prefix);
-  }
-
-  for (const property of node.propertySignatures ?? []) {
-    patterns.push(
-      ...collectSecretPathPatterns(
-        property.type as Parameters<typeof collectSecretPathPatterns>[0],
-        [...prefix, property.name],
-      ),
-    );
-  }
-
-  for (const indexSignature of node.indexSignatures ?? []) {
-    patterns.push(
-      ...collectSecretPathPatterns(
-        indexSignature.type as Parameters<typeof collectSecretPathPatterns>[0],
-        [...prefix, "*"],
-      ),
-    );
-  }
-
-  return patterns;
-}
-
-const secretPathPatterns = collectSecretPathPatterns(ProjectConfigSchema.ast as never);
-
-function matchesPathPattern(
-  pattern: ReadonlyArray<string>,
-  actual: ReadonlyArray<string>,
-): boolean {
-  if (pattern.length !== actual.length) {
-    return false;
-  }
-
-  for (let index = 0; index < pattern.length; index += 1) {
-    if (pattern[index] !== "*" && pattern[index] !== actual[index]) {
-      return false;
-    }
-  }
-
-  return true;
-}
-
-function isSecretPath(path: ReadonlyArray<string>): boolean {
-  return secretPathPatterns.some((pattern) => matchesPathPattern(pattern, path));
-}
-
-function interpolateLeafValue(value: string, env: Readonly<Record<string, string>>): string {
-  const match = envReferencePattern.exec(value);
-  const envName = match?.[1];
-
-  if (envName === undefined) {
-    return value;
-  }
-
-  // Preserve the literal `env(VAR)` verbatim when VAR is unset. Matches Go's
-  // `apps/cli-go/pkg/config/decode_hooks.go:14-21` (LoadEnvHook).
-  if (!Object.prototype.hasOwnProperty.call(env, envName)) {
-    return value;
-  }
-
-  return env[envName] ?? value;
-}
-
-function toPathSegments(path: string): ReadonlyArray<string> {
-  if (path === "") {
-    return [];
-  }
-
-  return path.split(".").filter((segment) => segment.length > 0);
-}
-
-function interpolateValue(value: unknown, env: Readonly<Record<string, string>>): unknown {
-  if (Array.isArray(value)) {
-    return value.map((item) => interpolateValue(item, env));
-  }
-
-  if (typeof value === "object" && value !== null) {
-    const result: Record<string, unknown> = {};
-
-    for (const [key, child] of Object.entries(value)) {
-      result[key] = interpolateValue(child, env);
-    }
-
-    return result;
-  }
-
-  if (typeof value === "string") {
-    return interpolateLeafValue(value, env);
-  }
-
-  return value;
-}
-
-function redactValue(value: unknown, path: ReadonlyArray<string> = []): unknown {
-  if (Array.isArray(value)) {
-    return value.map((item, index) => redactValue(item, [...path, String(index)]));
-  }
-
-  if (typeof value === "object" && value !== null) {
-    const result: Record<string, unknown> = {};
-
-    for (const [key, child] of Object.entries(value)) {
-      result[key] = redactValue(child, [...path, key]);
-    }
-
-    return result;
-  }
-
-  if (typeof value === "string" && isSecretPath(path) && !isEnvReference(value)) {
-    return Redacted.make(value, { label: path.join(".") });
-  }
-
-  return value;
-}
-
-function resolveProjectValueAtPath(
-  value: unknown,
-  projectEnv: ProjectEnvironment,
-  path: ReadonlyArray<string>,
-): unknown {
-  const interpolated = interpolateValue(value, projectEnv.values);
-  return redactValue(interpolated, path);
-}
-
-export function resolveProjectValue<T>(
+/**
+ * Effect-typed counterpart of the plain sync `resolveCliConfigValue` in
+ * `./lib/resolve.ts`, additionally accepting the internal-only `goViperCompat` option.
+ *
+ * Accepts `Pick<CliProjectEnvironment, "values">` so a caller with only a project's env
+ * values, not the full loaded object, can pass `{ values }` directly.
+ */
+export function resolveCliConfigValue<T>(
   value: T,
-  projectEnv: ProjectEnvironment,
+  cliProjectEnv: Pick<CliProjectEnvironment, "values">,
   configPath: string,
-): Effect.Effect<ResolvedProjectValue<T>> {
-  return Effect.sync(
-    () =>
-      resolveProjectValueAtPath(
-        value,
-        projectEnv,
-        toPathSegments(configPath),
-      ) as ResolvedProjectValue<T>,
+  options?: InternalResolveCliConfigOptions,
+): Effect.Effect<ResolvedCliConfigValue<T>> {
+  return Effect.sync(() =>
+    resolveCliConfigValueAtPath(
+      value,
+      cliProjectEnv,
+      toPathSegments(configPath),
+      options?.goViperCompat ?? false,
+    ),
   );
 }
 
-export function resolveProjectSubtree<T>(
+/** See {@link resolveCliConfigValue}'s doc comment for why `cliProjectEnv` only needs `.values`. */
+export function resolveCliConfigSubtree<T>(
   value: T,
-  projectEnv: ProjectEnvironment,
+  cliProjectEnv: Pick<CliProjectEnvironment, "values">,
   pathPrefix: string,
-): Effect.Effect<ResolvedProjectValue<T>> {
-  return Effect.sync(
-    () =>
-      resolveProjectValueAtPath(
-        value,
-        projectEnv,
-        toPathSegments(pathPrefix),
-      ) as ResolvedProjectValue<T>,
+  options?: InternalResolveCliConfigOptions,
+): Effect.Effect<ResolvedCliConfigValue<T>> {
+  return Effect.sync(() =>
+    resolveCliConfigValueAtPath(
+      value,
+      cliProjectEnv,
+      toPathSegments(pathPrefix),
+      options?.goViperCompat ?? false,
+    ),
   );
 }

@@ -25,16 +25,14 @@ const defaultNotificationEnabled = false;
 const defaultSubject = "";
 const defaultContentPath = "";
 
-const templateNamePattern = new RegExp(
-  "^(invite|confirmation|recovery|magic_link|email_change|reauthentication)$",
-);
-
-const notificationNamePattern = new RegExp(
-  "^(password_changed|email_changed|phone_changed|identity_linked|identity_unlinked|mfa_factor_enrolled|mfa_factor_unenrolled)$",
-);
-
-const templateName = Schema.String.check(Schema.isPattern(templateNamePattern));
-const notificationName = Schema.String.check(Schema.isPattern(notificationNamePattern));
+/**
+ * `auth.email.template`/`notification` are open maps with no key restriction: an
+ * unrecognized key like `auth.email.template.custom` is a legitimate config
+ * shape, just never synced by Studio or `config push`. Record keys accept any
+ * string.
+ */
+const templateName = Schema.String;
+const notificationName = Schema.String;
 
 function requiredWhenEnabled<
   T extends Record<string, string | number | boolean | undefined> & { enabled: boolean },

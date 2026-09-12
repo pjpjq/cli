@@ -10,6 +10,7 @@ import { inbucket } from "./inbucket.ts";
 import { realtime } from "./realtime.ts";
 import { storage } from "./storage.ts";
 import { studio } from "./studio.ts";
+import { compute } from "./compute.ts";
 
 const projectId = Schema.optionalKey(
   Schema.String.annotate({
@@ -25,7 +26,7 @@ const remoteProjectId = Schema.String.annotate({
   tags: ["general"],
 }).pipe(Schema.withDecodingDefaultKey(Effect.succeed("")));
 
-const baseProjectConfigFields = {
+const baseCliConfigFields = {
   project_id: projectId,
   analytics,
   api,
@@ -37,10 +38,11 @@ const baseProjectConfigFields = {
   realtime,
   storage,
   studio,
+  compute,
   experimental,
 };
 
-const remoteProjectConfig = Schema.Struct({
+const remoteCliConfigBlock = Schema.Struct({
   project_id: remoteProjectId,
   analytics,
   api,
@@ -52,19 +54,39 @@ const remoteProjectConfig = Schema.Struct({
   realtime,
   storage,
   studio,
+  compute,
   experimental,
 }).pipe(Schema.withDecodingDefault(Effect.succeed({})));
 
-export const ProjectConfigSchema = Schema.Struct({
-  ...baseProjectConfigFields,
-  remotes: Schema.Record(Schema.String, remoteProjectConfig)
-    .annotate({
-      default: {},
-      description: "Remote branch-specific project configuration.",
-      tags: ["general"],
-    })
-    .pipe(Schema.withDecodingDefault(Effect.succeed({}))),
+/**
+ * Exported separately (not inlined into {@link CliConfigSchema}) so
+ * `packages/config/src/io.ts` can decode it on its own with
+ * `disableChecks: true`. Only the merged effective config gets full
+ * business-rule validation, never each remote block individually; decoding
+ * this schema normally would apply those `.check()`s (embedded in
+ * `auth`/`db`/etc.) to every remote regardless of selection, rejecting a valid
+ * but unselected `[remotes.prod.auth.external.github] enabled = true` stub with
+ * no secret.
+ */
+export const RemotesSchema = Schema.Record(Schema.String, remoteCliConfigBlock).annotate({
+  default: {},
+  description: "Remote branch-specific project configuration.",
+  tags: ["general"],
 });
 
-export type ProjectConfig = typeof ProjectConfigSchema.Type;
-export type ProjectConfigJson = typeof ProjectConfigSchema.Encoded;
+export const CliConfigSchema = Schema.Struct({
+  ...baseCliConfigFields,
+  remotes: RemotesSchema.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
+});
+
+export function toCliConfigJsonSchema() {
+  const document = Schema.toJsonSchemaDocument(CliConfigSchema);
+  return {
+    $schema: "https://json-schema.org/draft/2020-12/schema",
+    ...document.schema,
+    ...(Object.keys(document.definitions).length > 0 ? { $defs: document.definitions } : {}),
+  };
+}
+
+export type CliConfig = typeof CliConfigSchema.Type;
+export type CliConfigJson = typeof CliConfigSchema.Encoded;

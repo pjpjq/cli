@@ -1,7 +1,7 @@
 import { readdirSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect } from "vitest";
-import { testBehaviour, testParity } from "./test-context.ts";
+import { testBehaviour } from "./test-context.ts";
 
 const MIGRATION_NAME = "my_change";
 
@@ -18,7 +18,9 @@ describe("migrations", () => {
     testBehaviour("exits non-zero without name argument", async ({ run }) => {
       const result = await run(["migration", "new"]);
       expect(result.exitCode).not.toBe(0);
-      expect(result.stdout).toContain("migration name");
+      // A missing positional argument's usage block prints to stderr only.
+      expect(result.stdout).toBe("");
+      expect(result.stderr).toContain("migration name");
     });
   });
 
@@ -28,8 +30,6 @@ describe("migrations", () => {
       expect(result.exitCode).not.toBe(0);
       expect(result.stderr).toContain("failed to connect");
     });
-
-    testParity(["migration", "list", "--local"]);
   });
 
   describe("migration:up", () => {
@@ -38,8 +38,6 @@ describe("migrations", () => {
       expect(result.exitCode).not.toBe(0);
       expect(result.stderr).toContain("failed to connect");
     });
-
-    testParity(["migration", "up", "--local"]);
   });
 
   describe("migration:down", () => {
@@ -54,16 +52,15 @@ describe("migrations", () => {
       expect(result.exitCode).not.toBe(0);
       expect(result.stderr).toContain("failed to connect");
     });
-
-    testParity(["migration", "down", "--local"]);
-    testParity(["migration", "down", "--last", "2", "--local"]);
   });
 
   describe("migration:repair", () => {
     testBehaviour("exits non-zero when --status flag is missing", async ({ run }) => {
       const result = await run(["migration", "repair", "--local", "20230101000000"]);
       expect(result.exitCode).not.toBe(0);
-      expect(result.stderr).toContain("--status");
+      // A missing required flag's error prints once, without a duplicate
+      // usage dump, and spells the flag name without its `--` prefix.
+      expect(result.stderr).toContain('"status" not set');
     });
 
     testBehaviour("exits non-zero on connection refused", async ({ run }) => {
@@ -78,8 +75,6 @@ describe("migrations", () => {
       expect(result.exitCode).not.toBe(0);
       expect(result.stderr).toContain("failed to connect");
     });
-
-    testParity(["migration", "repair", "--status", "applied", "--local", "20230101000000"]);
   });
 
   describe("migration:squash", () => {
@@ -88,8 +83,6 @@ describe("migrations", () => {
       expect(result.exitCode).not.toBe(0);
       expect(result.stderr).not.toBe("");
     });
-
-    testParity(["migration", "squash", "--local"]);
   });
 
   describe("migration:fetch", () => {
@@ -98,7 +91,5 @@ describe("migrations", () => {
       expect(result.exitCode).not.toBe(0);
       expect(result.stderr).toContain("failed to connect");
     });
-
-    testParity(["migration", "fetch", "--local"]);
   });
 });

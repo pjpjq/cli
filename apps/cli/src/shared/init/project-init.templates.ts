@@ -18,9 +18,8 @@ extra_search_path = ["public", "extensions"]
 max_rows = 1000
 # Controls whether new tables, views, sequences and functions created in the \`public\` schema by
 # \`postgres\` are reachable through the Data API roles (\`anon\`, \`authenticated\`, \`service_role\`)
-# without explicit GRANTs. When unset, new entities are NOT auto-exposed, matching the new cloud
-# default. Set to \`true\` to keep the legacy behaviour of auto-exposing new entities; this is
-# deprecated and the field is removed on 2026-10-30 once the always-revoked behaviour is permanent.
+# without explicit GRANTs, matching the cloud default. Set to \`false\` to require explicit GRANTs
+# instead. Left unset, a fresh project falls back to \`true\`.
 # auto_expose_new_tables = true
 
 [api.tls]
@@ -59,8 +58,8 @@ max_client_conn = 100
 [db.migrations]
 # If disabled, migrations will be skipped during a db push or reset.
 enabled = true
-# Specifies an ordered list of schema files that describe your database.
-# Supports glob patterns relative to supabase directory: "./schemas/*.sql"
+# Specifies an ordered list of schema files, directories, or glob patterns that describe your database.
+# Supports paths relative to supabase directory: "./schemas/*.sql", "./database".
 schema_paths = []
 
 [db.seed]
@@ -252,7 +251,7 @@ otp_expiry = 3600
 # [auth.email.notification.password_changed]
 # enabled = true
 # subject = "Your password has been changed"
-# content_path = "./templates/password_changed_notification.html"
+# content_path = "./supabase/templates/password_changed_notification.html"
 
 [auth.sms]
 # Allow/disallow new user signups via SMS to your project.
@@ -260,7 +259,7 @@ enable_signup = false
 # If enabled, users need to confirm their phone number before signing in.
 enable_confirmations = false
 # Template for sending OTP to users
-template = "Your code is {{ \`{{ .Code }}\` }}"
+template = "Your code is {{ .Code }}"
 # Controls the minimum amount of time that must pass before sending another sms otp.
 max_frequency = "5s"
 
@@ -308,7 +307,7 @@ verify_enabled = false
 enroll_enabled = false
 verify_enabled = false
 otp_length = 6
-template = "Your code is {{ \`{{ .Code }}\` }}"
+template = "Your code is {{ .Code }}"
 max_frequency = "5s"
 
 # Configure MFA via WebAuthn
@@ -409,9 +408,11 @@ s3_secret_key = "env(S3_SECRET_KEY)"
 [experimental.pgdelta]
 enabled = true
 # Directory under \`supabase/\` where declarative files are written.
-# declarative_schema_path = "./database"
-# JSON string passed through to pg-delta SQL formatting.
-# format_options = "{\\"keywordCase\\":\\"upper\\",\\"indent\\":2,\\"maxWidth\\":80,\\"commaStyle\\":\\"trailing\\"}"
+# declarative_schema_path = "./schemas"
+# JSON string passed through to pg-delta SQL formatting. When omitted, SQL is
+# formatted with uppercase keywords, indent 2, max width 180, trailing commas,
+# and column/key alignment. Set to "null" to emit raw, unformatted SQL.
+# format_options = "{\\"keywordCase\\":\\"upper\\",\\"indent\\":2,\\"maxWidth\\":180,\\"commaStyle\\":\\"trailing\\"}"
 `;
 
 export const INIT_GITIGNORE_TEMPLATE = `# Supabase
@@ -465,7 +466,7 @@ export const INTELLIJ_DENO_TEMPLATE = `<?xml version="1.0" encoding="UTF-8"?>
 
 const ORIOLE_DB_VERSION = "15.1.0.150";
 
-export function renderProjectConfigTemplate(projectId: string, useOrioledb: boolean): string {
+export function renderCliConfigTemplate(projectId: string, useOrioledb: boolean): string {
   return CONFIG_TEMPLATE_RAW.replace("__PROJECT_ID__", projectId).replace(
     "__ORIOLEDB_VERSION__",
     useOrioledb ? ORIOLE_DB_VERSION : "",

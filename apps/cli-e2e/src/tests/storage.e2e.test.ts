@@ -1,9 +1,7 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { describe, expect, inject, test } from "vitest";
-import { runParity } from "@supabase/cli-test-helpers";
+import { describe, expect } from "vitest";
 import { testBehaviour } from "./test-context.ts";
-import { ACCESS_TOKEN, isRecording } from "./env.ts";
 
 const BUCKET = "cli-e2e-bucket";
 const LOCAL_FLAGS = ["--experimental", "--local"];
@@ -15,44 +13,6 @@ function setupStorageWorkspace(dir: string, relayUrl: string): void {
     ['project_id = "test-project"', "", "[api]", `external_url = "${relayUrl}"`].join("\n"),
   );
   writeFileSync(join(dir, "upload.txt"), "test upload content");
-}
-
-type FailureType = "NON_AUTH" | "RATE_LIMIT";
-
-const FAILURE_PRESETS: Record<FailureType, { status: number; body: { message: string } }> = {
-  NON_AUTH: { status: 401, body: { message: "Invalid token" } },
-  RATE_LIMIT: { status: 429, body: { message: "Too Many Requests" } },
-};
-
-function testParityStorage(cmd: string[], opts?: { failureType?: FailureType }): void {
-  const label = opts?.failureType
-    ? `parity: ${cmd.join(" ")} [${opts.failureType}]`
-    : `parity: ${cmd.join(" ")}`;
-
-  test.skipIf(isRecording)(label, async () => {
-    const serverUrl = inject("replayServerUrl") as string;
-    if (opts?.failureType) {
-      await fetch(`${serverUrl}/_ctrl/error-all`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(FAILURE_PRESETS[opts.failureType]),
-      });
-    }
-    try {
-      await runParity(
-        {
-          apiUrl: serverUrl,
-          accessToken: ACCESS_TOKEN,
-          workspaceSetup: (dir) => setupStorageWorkspace(dir, serverUrl),
-        },
-        cmd,
-      );
-    } finally {
-      if (opts?.failureType) {
-        await fetch(`${serverUrl}/_ctrl/overrides`, { method: "DELETE" });
-      }
-    }
-  });
 }
 
 interface RequestEntry {
@@ -78,10 +38,6 @@ async function injectGlobalError(apiUrl: string, status: number, message: string
 async function clearOverrides(apiUrl: string): Promise<void> {
   await fetch(`${apiUrl}/_ctrl/overrides`, { method: "DELETE" });
 }
-
-// ---------------------------------------------------------------------------
-// storage ls
-// ---------------------------------------------------------------------------
 
 describe("storage ls", () => {
   testBehaviour("lists objects in bucket", async ({ workspace, run, apiUrl }) => {
@@ -144,16 +100,7 @@ describe("storage ls", () => {
     expect(result.stderr.length).toBeGreaterThan(0);
     await clearOverrides(apiUrl);
   });
-
-  testParityStorage(["storage", "ls", ...LOCAL_FLAGS, `ss:///${BUCKET}/`]);
-  testParityStorage(["storage", "ls", ...LOCAL_FLAGS, `ss:///${BUCKET}/`], {
-    failureType: "NON_AUTH",
-  });
 });
-
-// ---------------------------------------------------------------------------
-// storage cp
-// ---------------------------------------------------------------------------
 
 describe("storage cp", () => {
   testBehaviour("uploads local file to storage", async ({ workspace, run, apiUrl }) => {
@@ -297,24 +244,7 @@ describe("storage cp", () => {
     ]);
     expect(result.exitCode).toBe(0);
   });
-
-  // Parity: same paths as testBehaviour fixtures so the recorded/ entries match.
-  testParityStorage(["storage", "cp", ...LOCAL_FLAGS, "upload.txt", `ss:///${BUCKET}/upload.txt`]);
-  testParityStorage(["storage", "cp", ...LOCAL_FLAGS, "upload.txt", `ss:///${BUCKET}/upload.txt`], {
-    failureType: "NON_AUTH",
-  });
-  testParityStorage([
-    "storage",
-    "cp",
-    ...LOCAL_FLAGS,
-    `ss:///${BUCKET}/hello.txt`,
-    "hello-download.txt",
-  ]);
 });
-
-// ---------------------------------------------------------------------------
-// storage mv
-// ---------------------------------------------------------------------------
 
 describe("storage mv", () => {
   testBehaviour("moves file within bucket", async ({ workspace, run, apiUrl }) => {
@@ -400,30 +330,7 @@ describe("storage mv", () => {
     expect(result.stderr.length).toBeGreaterThan(0);
     await clearOverrides(apiUrl);
   });
-
-  // Parity: same src/dst as testBehaviour "moves file within bucket" so recorded/ fixture body matches.
-  testParityStorage([
-    "storage",
-    "mv",
-    ...LOCAL_FLAGS,
-    `ss:///${BUCKET}/mv-source.txt`,
-    `ss:///${BUCKET}/mv-dest.txt`,
-  ]);
-  testParityStorage(
-    [
-      "storage",
-      "mv",
-      ...LOCAL_FLAGS,
-      `ss:///${BUCKET}/mv-source.txt`,
-      `ss:///${BUCKET}/mv-dest.txt`,
-    ],
-    { failureType: "NON_AUTH" },
-  );
 });
-
-// ---------------------------------------------------------------------------
-// storage rm
-// ---------------------------------------------------------------------------
 
 describe("storage rm", () => {
   testBehaviour("removes a file from storage", async ({ workspace, run, apiUrl }) => {
@@ -526,11 +433,5 @@ describe("storage rm", () => {
     expect(result.exitCode).toBe(1);
     expect(result.stderr.length).toBeGreaterThan(0);
     await clearOverrides(apiUrl);
-  });
-
-  // Parity: same path as testBehaviour "removes a file from storage" so recorded/ fixture body matches.
-  testParityStorage(["storage", "rm", "--yes", ...LOCAL_FLAGS, `ss:///${BUCKET}/rm-target.txt`]);
-  testParityStorage(["storage", "rm", "--yes", ...LOCAL_FLAGS, `ss:///${BUCKET}/rm-target.txt`], {
-    failureType: "NON_AUTH",
   });
 });

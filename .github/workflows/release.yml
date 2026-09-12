@@ -19,25 +19,22 @@ on:
         required: true
         type: choice
         options:
-          - alpha
           - beta
           - stable
       version:
         description: npm package version to publish (must be unique on npm; pick the next unused version)
         required: true
         type: string
-      # Defaults to `true` so a stray "Run workflow" click can't accidentally
-      # publish — operators recovering from a stale-bytes run must consciously
-      # untick this when dispatching.
+      # Defaults to `true` so a stray "Run workflow" click can't accidentally publish; operators
+      # must consciously untick this when dispatching.
       dry_run:
         description: Dry run (skip actual publishing)
         required: false
         type: boolean
         default: true
 
-# The release pipeline mutates external package registries, git tags, GitHub
-# Releases, Homebrew, and Scoop. Keep one release per ref active at a time so
-# duplicate push events cannot race the same computed version.
+# The release pipeline mutates external registries, git tags, GitHub Releases, Homebrew, and
+# Scoop, so keep one release per ref active at a time to avoid duplicate push events racing.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
@@ -64,7 +61,7 @@ jobs:
           client-id: ${{ vars.GH_APP_CLIENT_ID }}
           private-key: ${{ secrets.GH_APP_PRIVATE_KEY }}
           permission-contents: write
-      - uses: useblacksmith/checkout@41cdeedae8edb2e684ba22896a5fd2a3cb85db6b # v1
+      - uses: useblacksmith/checkout@6fd481652155169ed4d2f25ebaf97464f685175f # v1
         with:
           persist-credentials: true
           fetch-depth: 0
@@ -83,7 +80,6 @@ jobs:
     outputs:
       should_release: ${{ steps.compute.outputs.should_release }}
       version: ${{ steps.compute.outputs.version }}
-      shell: ${{ steps.compute.outputs.shell }}
       npm_tag: ${{ steps.compute.outputs.npm_tag }}
       prerelease: ${{ steps.compute.outputs.prerelease }}
       brew_name: ${{ steps.compute.outputs.brew_name }}
@@ -92,11 +88,9 @@ jobs:
       dry_run: ${{ steps.compute.outputs.dry_run }}
       channel: ${{ steps.compute.outputs.channel }}
     steps:
-      # semantic-release runs `git push --dry-run HEAD:<branch>` as part of
-      # verifyAuth even in `dry_run: true` mode, so the token must have push
-      # access to the protected `develop`/`main` branches. The default
-      # GITHUB_TOKEN doesn't, so we mint an App-installation token from the
-      # same App used for fast-forward + brew/scoop pushes.
+      # semantic-release runs `git push --dry-run HEAD:<branch>` as part of verifyAuth even in
+      # `dry_run: true` mode, so the token needs push access to the protected develop/main
+      # branches — the default GITHUB_TOKEN doesn't have it.
       - id: app-token
         if: github.event_name == 'push'
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
@@ -104,12 +98,10 @@ jobs:
           client-id: ${{ vars.GH_APP_CLIENT_ID }}
           private-key: ${{ secrets.GH_APP_PRIVATE_KEY }}
           permission-contents: write
-      # `persist-credentials: false` is required: otherwise checkout caches the
-      # default GITHUB_TOKEN as an `http.extraheader` in git config, and that
-      # Authorization header overrides the App token semantic-release puts in
-      # the push URL — making the dry-push identify as `github-actions[bot]`
-      # and get rejected by branch protection.
-      - uses: useblacksmith/checkout@41cdeedae8edb2e684ba22896a5fd2a3cb85db6b # v1
+      # `persist-credentials: false` is required: otherwise checkout caches the default
+      # GITHUB_TOKEN in git config, and its Authorization header overrides the App token
+      # semantic-release puts in the push URL, making the dry-push get rejected by branch protection.
+      - uses: useblacksmith/checkout@6fd481652155169ed4d2f25ebaf97464f685175f # v1
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -152,16 +144,7 @@ jobs:
             fi
           fi
           case "$channel" in
-            alpha)
-              shell=next
-              npm_tag=alpha
-              prerelease=true
-              brew_name=""
-              scoop_name=""
-              publish_brew_scoop=false
-              ;;
             beta)
-              shell=legacy
               npm_tag=beta
               prerelease=true
               brew_name=supabase-beta
@@ -169,7 +152,6 @@ jobs:
               publish_brew_scoop=true
               ;;
             stable)
-              shell=legacy
               npm_tag=latest
               prerelease=false
               brew_name=supabase
@@ -184,7 +166,6 @@ jobs:
           {
             echo "should_release=$should_release"
             echo "version=$version"
-            echo "shell=$shell"
             echo "npm_tag=$npm_tag"
             echo "prerelease=$prerelease"
             echo "brew_name=$brew_name"
@@ -198,19 +179,17 @@ jobs:
     name: Release
     needs: plan
     if: needs.plan.outputs.should_release == 'true'
-    # pull-requests: write is required by the nested propose-release-notes
-    # workflow (release-shared.yml -> propose-release-notes.yml). For nested
-    # reusable workflows, a called job's permissions can't exceed those granted
-    # to the calling job, so this must be declared here even though the propose
-    # job uses an App token for its actual PR creation.
+    # pull-requests: write is required by the nested propose-release-notes workflow
+    # (release-shared.yml -> propose-release-notes.yml): a called job's permissions can't exceed
+    # those granted to the calling job, so this must be declared here too.
     permissions:
+      actions: read
       contents: write
       id-token: write
       pull-requests: write
     uses: ./.github/workflows/release-shared.yml
     with:
       version: ${{ needs.plan.outputs.version }}
-      shell: ${{ needs.plan.outputs.shell }}
       npm_tag: ${{ needs.plan.outputs.npm_tag }}
       prerelease: ${{ needs.plan.outputs.prerelease == 'true' }}
       publish_brew_scoop: ${{ needs.plan.outputs.publish_brew_scoop == 'true' }}
@@ -225,13 +204,65 @@ jobs:
       GH_APP_PRIVATE_KEY: ${{ secrets.GH_APP_PRIVATE_KEY }}
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
       DF_FIREWALL_TOKEN: ${{ secrets.DF_FIREWALL_TOKEN }}
+      LINEAR_CLI_STABLE_RELEASE_ACCESS_KEY: ${{ secrets.LINEAR_CLI_STABLE_RELEASE_ACCESS_KEY }}
+      LINEAR_CLI_BETA_RELEASE_ACCESS_KEY: ${{ secrets.LINEAR_CLI_BETA_RELEASE_ACCESS_KEY }}
+      SUPABASE_E2E_CLI_LIVE_STAGING_ACCESS_TOKEN: ${{ secrets.SUPABASE_E2E_CLI_LIVE_STAGING_ACCESS_TOKEN }}
 
-  # Posts to the release Slack channel once the pipeline succeeds. Listing
-  # `release` in `needs` without a status function in `if:` keeps the implicit
-  # success() gate, so this only runs when both plan and release succeeded.
-  # The `if:` then filters to real (non-dry-run) stable cuts; alpha, beta, and
-  # dry runs stay silent. Nothing depends on this job, so a Slack/webhook
-  # failure can't affect the already-completed release.
+  # Republishes the supabase.com CLI reference. Stable only: the reference documents the CLI
+  # users actually install, so pre-releases are skipped. Nothing depends on this job, so a
+  # docs-site failure cannot affect the already-completed release.
+  docs:
+    name: Publish reference docs
+    needs: [plan, release]
+    if: needs.plan.outputs.channel == 'stable'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    continue-on-error: true
+    steps:
+      # Scoped to supabase/supabase: this job pushes a branch and opens a PR
+      # there, and needs nothing beyond a plain read-only checkout here.
+      - id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.GH_APP_CLIENT_ID }}
+          private-key: ${{ secrets.GH_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: |
+            supabase
+          permission-contents: write
+          permission-pull-requests: write
+      - uses: useblacksmith/checkout@6fd481652155169ed4d2f25ebaf97464f685175f # v1
+        with:
+          persist-credentials: false
+      - name: Setup
+        uses: ./.github/actions/setup
+        with:
+          dependency-firewall-token: ${{ secrets.DF_FIREWALL_TOKEN }}
+      - name: Authenticate git for the docs push
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: gh auth setup-git
+      - name: Publish the CLI reference
+        working-directory: apps/cli
+        # `shell: bash` for `-o pipefail`: the default `run:` shell takes only the publisher's
+        # exit status, so a generator that died part-way would look like a successful run.
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          VERSION: ${{ needs.plan.outputs.version }}
+          DRY_RUN: ${{ needs.plan.outputs.dry_run }}
+        run: |
+          args=()
+          if [[ "$DRY_RUN" == "true" ]]; then
+            args+=(--dry-run)
+          fi
+          bun scripts/generate-docs-spec.ts "$VERSION" \
+            | bun scripts/publish-docs-spec.ts --version "$VERSION" "${args[@]}"
+
+  # Listing `release` in `needs` without a status function in `if:` keeps the implicit success()
+  # gate, so this only runs when both plan and release succeeded; the `if:` then filters to real
+  # (non-dry-run) stable cuts. Nothing depends on this job, so a Slack failure can't affect the
+  # already-completed release.
   notify-slack:
     name: Notify Slack
     needs: [plan, release]
@@ -240,25 +271,25 @@ jobs:
       needs.plan.outputs.channel == 'stable'
     uses: ./.github/workflows/slack-notify.yml
     with:
+      package: Supabase CLI
       status: success
       version: ${{ needs.plan.outputs.version }}
       channel: ${{ needs.plan.outputs.channel }}
     secrets:
       SLACK_RELEASE_WEBHOOK: ${{ secrets.SLACK_RELEASE_WEBHOOK }}
 
-  # Reports a broken release on every channel. `failure()` evaluates against the
-  # `needs` chain, so this fires whenever `plan` or `release` (and anything in
-  # the reusable release-shared workflow) fails. Skipped jobs — e.g. the
-  # fast-forward path or a release that never started — don't count as failures,
-  # so this stays quiet there. Dry runs are excluded; an operator running one is
-  # already watching it live. When `plan` fails its outputs are empty, so the
-  # message falls back to the workflow run link as the actionable detail.
+  # Reports a broken release on every channel. `failure()` evaluates against the full `needs`
+  # chain, so this fires whenever `plan` or `release` (including the reusable release-shared
+  # workflow) fails. Skipped jobs — e.g. the fast-forward path, or a release that never started —
+  # don't count as failures. Dry runs are excluded via the dispatch input directly, so even a
+  # plan job that dies before recording its `dry_run` output stays quiet.
   notify-slack-failure:
     name: Notify Slack (failure)
     needs: [plan, release]
-    if: failure() && needs.plan.outputs.dry_run != 'true'
+    if: ${{ failure() && !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
     uses: ./.github/workflows/slack-notify.yml
     with:
+      package: Supabase CLI
       status: failure
       version: ${{ needs.plan.outputs.version }}
       channel: ${{ needs.plan.outputs.channel }}

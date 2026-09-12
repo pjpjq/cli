@@ -1,12 +1,21 @@
 import { Effect, FileSystem, Path } from "effect";
+import type { PlatformError } from "effect/PlatformError";
 
-export interface ProjectPaths {
+export interface CliProjectPaths {
   readonly projectRoot: string;
   readonly supabaseDir: string;
   readonly configPath: string;
   readonly envPath: string;
   readonly envLocalPath: string;
 }
+
+// Any stat failure (e.g. ENOTDIR when this root has a file named `supabase`) means "no config
+// here", not a fatal error — log it at Debug and keep searching.
+const probeExists = (self: Effect.Effect<boolean, PlatformError>) =>
+  self.pipe(
+    Effect.tapError((error) => Effect.logDebug("config probe failed", error)),
+    Effect.orElseSucceed(() => false),
+  );
 
 const findConfigInRoot = Effect.fnUntraced(function* (root: string) {
   const fs = yield* FileSystem.FileSystem;
@@ -15,8 +24,8 @@ const findConfigInRoot = Effect.fnUntraced(function* (root: string) {
   const jsonPath = path.join(supabaseDir, "config.json");
   const tomlPath = path.join(supabaseDir, "config.toml");
 
-  const jsonExists = yield* fs.exists(jsonPath);
-  const tomlExists = yield* fs.exists(tomlPath);
+  const jsonExists = yield* probeExists(fs.exists(jsonPath));
+  const tomlExists = yield* probeExists(fs.exists(tomlPath));
 
   if (!jsonExists && !tomlExists) {
     return null;
@@ -28,13 +37,30 @@ const findConfigInRoot = Effect.fnUntraced(function* (root: string) {
     configPath: jsonExists ? jsonPath : tomlPath,
     envPath: path.join(supabaseDir, ".env"),
     envLocalPath: path.join(supabaseDir, ".env.local"),
-  } satisfies ProjectPaths;
+  } satisfies CliProjectPaths;
 });
 
-export const findProjectPaths = Effect.fnUntraced(function* (cwd: string) {
-  const path = yield* Path.Path;
-  let current = path.resolve(cwd);
+export interface FindCliProjectPathsOptions {
+  /**
+   * When `false`, only `cwd` itself is checked — no ancestor climb. Pass `false` when the
+   * caller already holds an authoritative project root, to avoid picking up an unrelated
+   * ancestor's config. Defaults to `true`.
+   */
+  readonly search?: boolean;
+}
 
+export const findCliProjectPaths = Effect.fnUntraced(function* (
+  cwd: string,
+  options?: FindCliProjectPathsOptions,
+) {
+  const path = yield* Path.Path;
+  const start = path.resolve(cwd);
+
+  if (options?.search === false) {
+    return yield* findConfigInRoot(start);
+  }
+
+  let current = start;
   while (true) {
     const match = yield* findConfigInRoot(current);
 
@@ -52,7 +78,10 @@ export const findProjectPaths = Effect.fnUntraced(function* (cwd: string) {
   }
 });
 
-export const findProjectRoot = Effect.fnUntraced(function* (cwd: string) {
-  const paths = yield* findProjectPaths(cwd);
+export const findCliProjectRoot = Effect.fnUntraced(function* (
+  cwd: string,
+  options?: FindCliProjectPathsOptions,
+) {
+  const paths = yield* findCliProjectPaths(cwd, options);
   return paths?.projectRoot ?? null;
 });

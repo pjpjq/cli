@@ -1,8 +1,0 @@
-{
-  "name": "@supabase/nx-plugins",
-  "private": true,
-  "dependencies": {
-    "@nx/devkit": "catalog:",
-    "vitest": "catalog:"
-  }
-}

@@ -22,22 +22,29 @@ import (
 	"github.com/jackc/pgx/v4"
 	"github.com/spf13/afero"
 	"github.com/supabase/cli/internal/db/start"
+	"github.com/supabase/cli/internal/migration/new"
 	"github.com/supabase/cli/internal/utils"
+	configpkg "github.com/supabase/cli/pkg/config"
 	"github.com/supabase/cli/pkg/migration"
 	"github.com/supabase/cli/pkg/parser"
 )
 
 type DiffFunc func(context.Context, pgconn.Config, pgconn.Config, []string, ...func(*pgx.ConnConfig)) (string, error)
 
-func Run(ctx context.Context, schema []string, file string, config pgconn.Config, differ DiffFunc, usePgDelta bool, fsys afero.Fs, options ...func(*pgx.ConnConfig)) (err error) {
-	result, err := DiffDatabase(ctx, schema, config, os.Stderr, fsys, differ, usePgDelta, options...)
+// DatabaseDiff is the result of diffing a target database against a shadow baseline.
+type DatabaseDiff struct {
+	SQL string
+}
+
+func Run(ctx context.Context, schema []string, file string, config pgconn.Config, differ DiffFunc, fsys afero.Fs, options ...func(*pgx.ConnConfig)) (err error) {
+	result, err := DiffDatabase(ctx, schema, config, os.Stderr, fsys, differ, options...)
 	if err != nil {
 		return err
 	}
 	out := result.SQL
 	branch := utils.GetGitBranch(fsys)
 	fmt.Fprintln(os.Stderr, "Finished "+utils.Aqua("supabase db diff")+" on branch "+utils.Aqua(branch)+".\n")
-	if err := SaveDiff(out, file, fsys); err != nil {
+	if err := SaveDiff(result, file, fsys); err != nil {
 		return err
 	}
 	drops := findDropStatements(out)
@@ -49,6 +56,13 @@ func Run(ctx context.Context, schema []string, file string, config pgconn.Config
 }
 
 func loadDeclaredSchemas(fsys afero.Fs) ([]string, error) {
+	if schemas := utils.Config.Db.Migrations.SchemaPaths; len(schemas) > 0 {
+		return schemas.SQLFiles(
+			afero.NewIOFS(fsys),
+			configpkg.WithSkipEmptyGlobs(),
+			configpkg.WithErrorOnAllSkippedGlobs(),
+		)
+	}
 	// When pg-delta is enabled, declarative path is the source of truth (config or default).
 	if utils.IsPgDeltaEnabled() {
 		declDir := utils.GetDeclarativeDir()
@@ -68,9 +82,6 @@ func loadDeclaredSchemas(fsys afero.Fs) ([]string, error) {
 			sort.Strings(declared)
 			return declared, nil
 		}
-	}
-	if schemas := utils.Config.Db.Migrations.SchemaPaths; len(schemas) > 0 {
-		return schemas.Files(afero.NewIOFS(fsys))
 	}
 	if exists, err := afero.DirExists(fsys, utils.SchemasDir); err != nil {
 		return nil, errors.Errorf("failed to check schemas: %w", err)
@@ -93,6 +104,25 @@ func loadDeclaredSchemas(fsys afero.Fs) ([]string, error) {
 	// filesystems and operating systems. This is only if no schema paths in config are set.
 	sort.Strings(declared)
 	return declared, nil
+}
+
+var warnDiff = `WARNING: The diff tool is not foolproof, so you may need to manually rearrange and modify the generated migration.
+Run ` + utils.Aqua("supabase db reset") + ` to verify that the new migration does not generate errors.`
+
+func SaveDiff(result DatabaseDiff, file string, fsys afero.Fs) error {
+	out := result.SQL
+	if len(out) < 2 {
+		fmt.Fprintln(os.Stderr, "No schema changes found")
+	} else if len(file) > 0 {
+		path := new.GetMigrationPath(utils.GetCurrentTimestamp(), file)
+		if err := utils.WriteFile(path, []byte(out), fsys); err != nil {
+			return err
+		}
+		fmt.Fprintln(os.Stderr, warnDiff)
+	} else {
+		fmt.Println(out)
+	}
+	return nil
 }
 
 // https://github.com/djrobstep/migra/blob/master/migra/statements.py#L6
@@ -185,9 +215,9 @@ func MigrateShadowDatabase(ctx context.Context, container string, fsys afero.Fs,
 	return migration.ApplyMigrations(ctx, migrations, conn, afero.NewIOFS(fsys))
 }
 
-func DiffDatabase(ctx context.Context, schema []string, config pgconn.Config, w io.Writer, fsys afero.Fs, differ DiffFunc, usePgDelta bool, options ...func(*pgx.ConnConfig)) (DatabaseDiff, error) {
+func DiffDatabase(ctx context.Context, schema []string, config pgconn.Config, w io.Writer, fsys afero.Fs, differ DiffFunc, options ...func(*pgx.ConnConfig)) (DatabaseDiff, error) {
 	fmt.Fprintln(w, "Creating shadow database...")
-	shadowSource, err := PrepareShadowSource(ctx, schema, utils.IsLocalDatabase(config), usePgDelta, fsys, options...)
+	shadowSource, err := PrepareShadowSource(ctx, utils.IsLocalDatabase(config), fsys, options...)
 	if err != nil {
 		return DatabaseDiff{}, err
 	}
@@ -196,28 +226,10 @@ func DiffDatabase(ctx context.Context, schema []string, config pgconn.Config, w 
 	if shadowSource.TargetOverride != nil {
 		config = *shadowSource.TargetOverride
 	}
-	// Load all user defined schemas
 	if len(schema) > 0 {
 		fmt.Fprintln(w, "Diffing schemas:", strings.Join(schema, ","))
 	} else {
 		fmt.Fprintln(w, "Diffing schemas...")
-	}
-	if IsPgDeltaDebugEnabled() && usePgDelta {
-		// Capture the shadow baseline catalog and edge-runtime stderr so an
-		// empty diff can be inspected later. DiffPgDeltaRefDetailed mirrors the
-		// pg-delta differ but additionally surfaces stderr, which differ() drops.
-		debugCapture := &PgDeltaDebugCapture{}
-		if snapshot, exportErr := exportCatalogPgDelta(ctx, utils.ToPostgresURL(shadowConfig), "postgres", options...); exportErr == nil {
-			debugCapture.SourceCatalog = snapshot
-		} else {
-			fmt.Fprintf(w, "Warning: failed to export shadow pg-delta catalog: %v\n", exportErr)
-		}
-		result, err := DiffPgDeltaRefDetailed(ctx, utils.ToPostgresURL(shadowConfig), utils.ToPostgresURL(config), schema, pgDeltaFormatOptions(), options...)
-		if err != nil {
-			return DatabaseDiff{}, err
-		}
-		debugCapture.Stderr = result.Stderr
-		return DatabaseDiff{SQL: result.SQL, Debug: debugCapture}, nil
 	}
 	output, err := differ(ctx, shadowConfig, config, schema, options...)
 	if err != nil {

@@ -1,4 +1,5 @@
 import { Effect, FileSystem, Path, Schema } from "effect";
+import { promptYesNo } from "../../command-internal/prompt-yes-no.ts";
 import { Output } from "../output/output.service.ts";
 import { Tty } from "../runtime/tty.service.ts";
 import {
@@ -6,7 +7,7 @@ import {
   INTELLIJ_DENO_TEMPLATE,
   VSCODE_EXTENSIONS_TEMPLATE,
   VSCODE_SETTINGS_TEMPLATE,
-  renderProjectConfigTemplate,
+  renderCliConfigTemplate,
 } from "./project-init.templates.ts";
 import { InitParseSettingsError } from "./project-init.errors.ts";
 
@@ -22,9 +23,8 @@ function sanitizeProjectId(src: string): string {
   return truncateText(sanitized, maxProjectIdLength);
 }
 
-// Mirrors Go's `jsonc.ToJSONInPlace` (github.com/tidwall/jsonc): strips line and
-// block comments and trailing commas while preserving string contents, so an
-// existing JSONC settings file parses exactly as it does in the Go CLI.
+// Strips line and block comments and trailing commas while preserving
+// string contents, so an existing JSONC settings file parses correctly.
 function stripJsonComments(contents: string): string {
   const src = contents.replace(/^\uFEFF/, "");
   const out: Array<string> = [];
@@ -33,7 +33,6 @@ function stripJsonComments(contents: string): string {
   while (i < src.length) {
     const char = src.charAt(i);
 
-    // String literal \u2014 copy verbatim, honoring escape sequences.
     if (char === '"') {
       pendingCommaIndex = -1;
       out.push(char);
@@ -54,7 +53,6 @@ function stripJsonComments(contents: string): string {
       continue;
     }
 
-    // Line comment.
     if (char === "/" && src.charAt(i + 1) === "/") {
       i += 2;
       while (i < src.length && src.charAt(i) !== "\n") {
@@ -63,7 +61,6 @@ function stripJsonComments(contents: string): string {
       continue;
     }
 
-    // Block comment.
     if (char === "/" && src.charAt(i + 1) === "*") {
       i += 2;
       while (i < src.length && !(src.charAt(i) === "*" && src.charAt(i + 1) === "/")) {
@@ -109,9 +106,9 @@ const decodeJsonObject = Schema.decodeUnknownEffect(
   Schema.fromJsonString(Schema.Record(Schema.String, Schema.Unknown)),
 );
 
-// Parses a settings file through a Schema boundary so malformed JSON surfaces as
-// a typed `InitParseSettingsError` (recoverable, never a fiber defect) and a
-// non-object document is rejected \u2014 matching Go's `json.Decoder` into a map.
+// Parses a settings file through a Schema boundary so malformed JSON surfaces
+// as a typed `InitParseSettingsError` (never a fiber defect) and a
+// non-object document is rejected.
 function parseJsonObject(pathname: string, contents: string) {
   return decodeJsonObject(stripJsonComments(contents)).pipe(
     Effect.mapError(
@@ -129,14 +126,28 @@ export interface ProjectInitOptions {
   readonly force: boolean;
   readonly useOrioledb: boolean;
   readonly interactive: boolean;
+  /**
+   * Auto-confirms the interactive IDE-settings prompts: with `--yes`/
+   * `SUPABASE_YES`, `init -i` echoes the accepted VS Code prompt to stderr
+   * and writes the settings instead of blocking on a TTY. Callers without a
+   * `--yes` flag pass `false`.
+   */
+  readonly yes: boolean;
   readonly withVscodeSettings: boolean;
   readonly withIntellijSettings: boolean;
 }
 
+// Files/directories are pinned to 0644/0755 explicitly rather than relying
+// on Node's umask-masked defaults, which only coincide under the common 022.
+const INIT_FILE_MODE = 0o644;
+const INIT_DIR_MODE = 0o755;
+
 function writeJsonFile(pathname: string, contents: Record<string, unknown>) {
   return Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;
-    yield* fs.writeFileString(pathname, `${JSON.stringify(contents, null, 2)}\n`);
+    yield* fs.writeFileString(pathname, `${JSON.stringify(contents, null, 2)}\n`, {
+      mode: INIT_FILE_MODE,
+    });
   });
 }
 
@@ -145,13 +156,13 @@ function updateJsonFile(pathname: string, template: string) {
     const fs = yield* FileSystem.FileSystem;
 
     if (!(yield* fs.exists(pathname))) {
-      yield* fs.writeFileString(pathname, template);
+      yield* fs.writeFileString(pathname, template, { mode: INIT_FILE_MODE });
       return;
     }
 
     const existing = yield* fs.readFileString(pathname);
     if (existing.trim().length === 0) {
-      yield* fs.writeFileString(pathname, template);
+      yield* fs.writeFileString(pathname, template, { mode: INIT_FILE_MODE });
       return;
     }
 
@@ -175,7 +186,7 @@ export const writeVscodeConfig = Effect.fnUntraced(function* (
   const extensionsPath = path.join(vscodeDir, "extensions.json");
   const settingsPath = path.join(vscodeDir, "settings.json");
 
-  yield* fs.makeDirectory(vscodeDir, { recursive: true });
+  yield* fs.makeDirectory(vscodeDir, { recursive: true, mode: INIT_DIR_MODE });
   yield* updateJsonFile(extensionsPath, VSCODE_EXTENSIONS_TEMPLATE);
   yield* updateJsonFile(settingsPath, VSCODE_SETTINGS_TEMPLATE);
 
@@ -198,8 +209,8 @@ export const writeIntelliJConfig = Effect.fnUntraced(function* (
   const intellijDir = path.join(cwd, ".idea");
   const denoPath = path.join(intellijDir, "deno.xml");
 
-  yield* fs.makeDirectory(intellijDir, { recursive: true });
-  yield* fs.writeFileString(denoPath, INTELLIJ_DENO_TEMPLATE);
+  yield* fs.makeDirectory(intellijDir, { recursive: true, mode: INIT_DIR_MODE });
+  yield* fs.writeFileString(denoPath, INTELLIJ_DENO_TEMPLATE, { mode: INIT_FILE_MODE });
 
   if (options?.announce ?? true) {
     yield* output.raw("Generated IntelliJ settings in .idea/deno.xml.\n");
@@ -209,19 +220,16 @@ export const writeIntelliJConfig = Effect.fnUntraced(function* (
   }
 });
 
-const promptForIdeSettings = Effect.fnUntraced(function* (cwd: string) {
+// `--yes`/`SUPABASE_YES` auto-accepts the VS Code prompt without reaching IntelliJ.
+const promptForIdeSettings = Effect.fnUntraced(function* (cwd: string, yes: boolean) {
   const output = yield* Output;
 
-  if (yield* output.promptConfirm("Generate VS Code settings for Deno?", { defaultValue: true })) {
+  if (yield* promptYesNo(output, yes, "Generate VS Code settings for Deno?", true)) {
     yield* writeVscodeConfig(cwd);
     return;
   }
 
-  if (
-    yield* output.promptConfirm("Generate IntelliJ IDEA settings for Deno?", {
-      defaultValue: false,
-    })
-  ) {
+  if (yield* promptYesNo(output, yes, "Generate IntelliJ IDEA settings for Deno?", false)) {
     yield* writeIntelliJConfig(cwd);
   }
 });
@@ -256,21 +264,24 @@ const ensureSupabaseGitignore = Effect.fnUntraced(function* (cwd: string) {
     if (existing.includes(INIT_GITIGNORE_TEMPLATE)) {
       return;
     }
-    const prefix = existing.length > 0 ? "\n" : "";
-    yield* fs.writeFileString(gitignorePath, `${existing}${prefix}${INIT_GITIGNORE_TEMPLATE}`);
+    // Always prepends a line break before appending, even to an empty file,
+    // producing a leading blank line in that case.
+    yield* fs.writeFileString(gitignorePath, `${existing}\n${INIT_GITIGNORE_TEMPLATE}`);
     return;
   }
 
-  yield* fs.writeFileString(gitignorePath, INIT_GITIGNORE_TEMPLATE);
+  // No mode here: the file already exists, and `writeFileString`'s mode only
+  // applies at creation.
+  yield* fs.writeFileString(gitignorePath, INIT_GITIGNORE_TEMPLATE, { mode: INIT_FILE_MODE });
 });
 
 /**
  * Scaffolds the local project files (config.toml, .gitignore, optional IDE
- * settings). This owns the mechanical filesystem work only — it does not decide
- * how an already-initialized project is reported. When `config.toml` already
- * exists and `force` is not set it short-circuits with `created: false` and
- * writes nothing, leaving each shell free to treat that as a hard error (legacy
- * Go parity) or a graceful no-op (next).
+ * settings). This owns the mechanical filesystem work only — it does not
+ * decide how an already-initialized project is reported. When
+ * `config.toml` already exists and `force` is not set it short-circuits
+ * with `created: false` and writes nothing, leaving the caller free to
+ * treat that as a hard error or a graceful no-op.
  */
 export const initProject = Effect.fnUntraced(function* (options: ProjectInitOptions) {
   const fs = yield* FileSystem.FileSystem;
@@ -288,16 +299,26 @@ export const initProject = Effect.fnUntraced(function* (options: ProjectInitOpti
 
   const projectId = sanitizeProjectId(path.basename(options.cwd)) || "supabase";
 
-  yield* fs.makeDirectory(supabaseDir, { recursive: true });
+  yield* fs.makeDirectory(supabaseDir, { recursive: true, mode: INIT_DIR_MODE });
   yield* fs.writeFileString(
     configTomlPath,
-    renderProjectConfigTemplate(projectId, options.useOrioledb),
+    renderCliConfigTemplate(projectId, options.useOrioledb),
+    { mode: INIT_FILE_MODE },
   );
   yield* ensureSupabaseGitignore(options.cwd);
 
-  const effectiveInteractive = options.interactive && tty.stdinIsTty && output.interactive;
+  // Requires text mode (json/stream-json stay payload-only and never scaffold
+  // IDE settings as an undisclosed side effect) and an interactive stdout,
+  // since clack renders its prompt UI there. `yes` lifts the stdout
+  // requirement: no prompt renders when the answer is auto-confirmed, so
+  // `init -i --yes` with a piped stdout still writes the VS Code settings.
+  const effectiveInteractive =
+    options.interactive &&
+    tty.stdinIsTty &&
+    output.format === "text" &&
+    (output.interactive || options.yes);
   if (effectiveInteractive) {
-    yield* promptForIdeSettings(options.cwd);
+    yield* promptForIdeSettings(options.cwd, options.yes);
   }
   if (options.withVscodeSettings) {
     yield* writeVscodeConfig(options.cwd);

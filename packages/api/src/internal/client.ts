@@ -47,7 +47,8 @@ export interface SupabaseApiClientOptions {
 export type SupabaseApiError =
   | HttpBody.HttpBodyError
   | HttpClientError.HttpClientError
-  | SchemaError;
+  | SchemaError
+  | SupabaseApiInputError;
 
 export interface SupabaseApiClientShape {
   readonly execute: <Id extends OperationId>(
@@ -55,12 +56,11 @@ export interface SupabaseApiClientShape {
     input: OperationInput<Id>,
   ) => Effect.Effect<OperationOutput<Id>, SupabaseApiError>;
   /**
-   * Execute an operation but return the raw HTTP response without decoding the
-   * output schema or filtering on status. Use this when the response body
-   * cannot satisfy the strict generated schema (e.g. cli-e2e replay fixtures
-   * embed a `__PROJECT_REF__` placeholder that violates `ref`'s 20-char
-   * pattern), so the caller can parse the body leniently. Request building —
-   * URL, auth, headers, body serialization — is identical to `execute`.
+   * Executes an operation but returns the raw HTTP response, without decoding
+   * the output schema or filtering on status. Use this when the response body
+   * can't satisfy the strict generated schema (e.g. a replay fixture embeds a
+   * placeholder value that violates a field's pattern). Request building is
+   * identical to `execute`.
    */
   readonly executeRaw: <Id extends OperationId>(
     definition: OperationDefinition<Id>,
@@ -80,6 +80,38 @@ export class SupabaseApiConfigError extends Error {
     super(message);
     this.name = "SupabaseApiConfigError";
   }
+}
+
+export type SupabaseApiInputErrorSource = "generated_client" | "user_input";
+
+/**
+ * The generated client's input schema rejected the request before it was sent.
+ * Defaults to `generated_client` since a rejection is usually a caller assembly
+ * bug; command boundaries can reclassify a confirmed user-derived request as
+ * `user_input`. The original schema failure is preserved as `cause`.
+ */
+export class SupabaseApiInputError extends Error {
+  readonly _tag = "SupabaseApiInputError";
+  #source: SupabaseApiInputErrorSource = "generated_client";
+
+  get source(): SupabaseApiInputErrorSource {
+    return this.#source;
+  }
+
+  constructor(message: string, options?: { readonly cause?: unknown }) {
+    super(message, options);
+    this.name = "SupabaseApiInputError";
+  }
+
+  static markAsUserInput<T extends SupabaseApiInputError>(error: T): T {
+    error.#source = "user_input";
+    return error;
+  }
+}
+
+/** Mark a confirmed user-derived request while preserving error identity. */
+export function markSupabaseApiInputErrorAsUserInput<T extends SupabaseApiInputError>(error: T): T {
+  return SupabaseApiInputError.markAsUserInput(error);
 }
 
 function resolveSupabaseApiConfig(
@@ -339,11 +371,9 @@ function asBinaryRequestBody(value: unknown): Effect.Effect<Uint8Array, HttpBody
   return Effect.succeed(new TextEncoder().encode(String(revealed)));
 }
 
-// Serialize JSON bodies with alphabetically-sorted keys (recursively) to match
-// Go's `encoding/json`, which emits oapi-codegen's alphabetically-declared
-// struct fields and sorts map keys. Without this, multi-field request bodies
-// serialize in OpenAPI-spec field order and diverge from the Go CLI on the
-// wire (only single/already-sorted bodies happen to match).
+// Serializes JSON bodies with keys sorted alphabetically (recursively) so the
+// wire format matches recorded replay fixtures; the spec's field order would
+// otherwise diverge from them for multi-field bodies.
 function sortJsonKeysDeep(value: unknown): unknown {
   if (Array.isArray(value)) {
     return value.map(sortJsonKeysDeep);
@@ -516,7 +546,9 @@ export function makeSupabaseApiClient(
     return {
       execute: (definition, input) =>
         Effect.gen(function* () {
-          const validated = yield* Schema.decodeUnknownEffect(definition.inputSchema)(input);
+          const validated = yield* Schema.decodeUnknownEffect(definition.inputSchema)(input).pipe(
+            Effect.mapError((error) => new SupabaseApiInputError(error.message, { cause: error })),
+          );
           const response = yield* executeRequest(prepared, definition, validated);
           if (isJsonOperation(definition)) {
             return yield* decodeJsonResponse(definition, response);
@@ -531,7 +563,9 @@ export function makeSupabaseApiClient(
         }),
       executeRaw: (definition, input, headers) =>
         Effect.gen(function* () {
-          const validated = yield* Schema.decodeUnknownEffect(definition.inputSchema)(input);
+          const validated = yield* Schema.decodeUnknownEffect(definition.inputSchema)(input).pipe(
+            Effect.mapError((error) => new SupabaseApiInputError(error.message, { cause: error })),
+          );
           const request = yield* buildRequest(definition, validated).pipe(
             Effect.map((request) =>
               headers === undefined ? request : HttpClientRequest.setHeaders(request, headers),

@@ -67,7 +67,7 @@ func (s *EdgeRuntimeAPI) Deploy(ctx context.Context, functionConfig config.Funct
 	return s.bulkUpload(ctx, toDeploy, fsys)
 }
 
-func (s *EdgeRuntimeAPI) listRemoteFunctionsForVerifyJwt(ctx context.Context, functionConfig config.FunctionConfig) (map[string]api.FunctionResponse, error) {
+func (s *EdgeRuntimeAPI) listRemoteFunctionsForVerifyJwt(ctx context.Context, functionConfig config.FunctionConfig) (map[string]api.FunctionResponseOutput, error) {
 	needsRemote := false
 	for _, fc := range functionConfig {
 		if fc.Enabled && fc.VerifyJWT == nil {
@@ -84,7 +84,7 @@ func (s *EdgeRuntimeAPI) listRemoteFunctionsForVerifyJwt(ctx context.Context, fu
 	} else if resp.JSON200 == nil {
 		return nil, errors.Errorf("unexpected list functions status %d: %s", resp.StatusCode(), string(resp.Body))
 	}
-	remoteFunctions := make(map[string]api.FunctionResponse, len(*resp.JSON200))
+	remoteFunctions := make(map[string]api.FunctionResponseOutput, len(*resp.JSON200))
 	for _, function := range *resp.JSON200 {
 		remoteFunctions[function.Slug] = function
 	}
@@ -105,16 +105,27 @@ func toRelPath(fp string) string {
 func (s *EdgeRuntimeAPI) bulkUpload(ctx context.Context, toDeploy []FunctionDeployMetadata, fsys fs.FS) error {
 	jq := queue.NewJobQueue(s.maxJobs)
 	toUpdate := make(api.BulkUpdateFunctionBody, len(toDeploy))
+	// Bulk uploads only write the bundle and bump the version remotely, so the new metadata
+	// exists nowhere but this client until the final bulk update request persists it. Bailing
+	// out on the first upload error strands that metadata and makes every subsequent deploy
+	// fail with a version conflict, so we keep going and report the errors at the end.
+	//
+	// Upload errors are recorded per function index rather than surfaced through the job
+	// queue's error channel, so they are reported in input order regardless of completion
+	// order under concurrent --jobs, matching the TS port.
+	uploadErrs := make([]error, len(toDeploy))
+	var queueErrs []error
 	for i, meta := range toDeploy {
 		param := api.V1DeployAFunctionParams{
 			Slug:       meta.Name,
-			BundleOnly: cast.Ptr(true),
+			BundleOnly: cast.Ptr("true"),
 		}
 		bundle := func() error {
 			fmt.Fprintln(os.Stderr, "Deploying Function:", *meta.Name)
 			resp, err := s.upload(ctx, param, meta, fsys)
 			if err != nil {
-				return err
+				uploadErrs[i] = err
+				return nil
 			}
 			toUpdate[i].Id = resp.Id
 			toUpdate[i].Name = resp.Name
@@ -128,28 +139,35 @@ func (s *EdgeRuntimeAPI) bulkUpload(ctx context.Context, toDeploy []FunctionDepl
 			toUpdate[i].CreatedAt = resp.CreatedAt
 			return nil
 		}
-		if err := jq.Put(bundle); err != nil {
-			return err
+		queueErrs = append(queueErrs, jq.Put(bundle))
+	}
+	queueErrs = append(queueErrs, jq.Collect())
+	bundleErr := errors.Join(append(uploadErrs, queueErrs...)...)
+	// Failed uploads leave their slot zero valued, ie. without a function id.
+	uploaded := make(api.BulkUpdateFunctionBody, 0, len(toUpdate))
+	for _, f := range toUpdate {
+		if len(f.Id) > 0 {
+			uploaded = append(uploaded, f)
 		}
 	}
-	if err := jq.Collect(); err != nil {
-		return err
+	if len(uploaded) == 0 {
+		return bundleErr
 	}
 	for attempt := 0; ; attempt++ {
-		resp, err := s.client.V1BulkUpdateFunctionsWithResponse(ctx, s.project, toUpdate)
+		resp, err := s.client.V1BulkUpdateFunctionsWithResponse(ctx, s.project, uploaded)
 		if err != nil {
-			return errors.Errorf("failed to bulk update: %w", err)
+			return errors.Join(bundleErr, errors.Errorf("failed to bulk update: %w", err))
 		} else if resp.JSON200 != nil {
-			return nil
+			return bundleErr
 		} else if resp.StatusCode() != http.StatusTooManyRequests || attempt >= deployRateLimitMaxRetries {
-			return errors.Errorf("unexpected bulk update status %d: %s", resp.StatusCode(), string(resp.Body))
+			return errors.Join(bundleErr, errors.Errorf("unexpected bulk update status %d: %s", resp.StatusCode(), string(resp.Body)))
 		} else if err := waitForRateLimit(ctx, responseHeaders(resp.HTTPResponse), attempt, "bulk updating functions"); err != nil {
-			return err
+			return errors.Join(bundleErr, err)
 		}
 	}
 }
 
-func (s *EdgeRuntimeAPI) upload(ctx context.Context, param api.V1DeployAFunctionParams, meta FunctionDeployMetadata, fsys fs.FS) (*api.DeployFunctionResponse, error) {
+func (s *EdgeRuntimeAPI) upload(ctx context.Context, param api.V1DeployAFunctionParams, meta FunctionDeployMetadata, fsys fs.FS) (*api.DeployFunctionResponseOutput, error) {
 	for attempt := 0; ; attempt++ {
 		resp, err := s.uploadOnce(ctx, param, meta, fsys)
 		if resp != nil && resp.JSON201 != nil {

@@ -14,14 +14,22 @@ import {
   text,
 } from "@clack/prompts";
 import { styleText } from "node:util";
-import { Effect, Layer, Stdio, Stream } from "effect";
+import { Effect, Layer, Option, Stdio, Stream } from "effect";
 
 import { Tty } from "../runtime/tty.service.ts";
-import { NonInteractiveError } from "./errors.ts";
+import { CONTEXT_CANCELED_MESSAGE, NonInteractiveError } from "./errors.ts";
+import { MachineErrorContext } from "./machine-error-context.service.ts";
 import { Output } from "./output.service.ts";
 import type { OutputFormat, StreamEvent } from "./types.ts";
 
 const TASK_SPINNER_DELAY_MS = 200;
+
+// Reads the opt-in `MachineErrorContext` cell, if any command in this run
+// provided it — see that service's doc comment for the envelope contract.
+const readMachineErrorContext = Effect.fnUntraced(function* () {
+  const context = yield* Effect.serviceOption(MachineErrorContext);
+  return Option.isSome(context) ? yield* context.value.get : {};
+});
 
 function formatTaskMessage(message: string | undefined): string | undefined {
   if (message === undefined || !message.includes("\n")) {
@@ -34,6 +42,18 @@ function formatTaskMessage(message: string | undefined): string | undefined {
 }
 
 /**
+ * Shared by all three layers. The sink waits for `drain`; `process.stdout.write`
+ * does not, so a streamed payload piped to a slow consumer buffers in memory.
+ */
+const stdioWriter =
+  (stdio: typeof Stdio.Stdio.Service) =>
+  (chunk: string | Uint8Array, stream: "stdout" | "stderr" = "stdout") =>
+    Stream.make(chunk).pipe(
+      Stream.run(stream === "stderr" ? stdio.stderr() : stdio.stdout()),
+      Effect.orDie,
+    );
+
+/**
  * Output layers - Concrete output mode implementations for the CLI.
  *
  * Each layer binds the shared `Output` contract to one transport policy:
@@ -43,6 +63,8 @@ export const textOutputLayer = Layer.effect(
   Output,
   Effect.gen(function* () {
     const tty = yield* Tty;
+    const write = stdioWriter(yield* Stdio.Stdio);
+
     const DEFAULT_AUTOCOMPLETE_THRESHOLD = 10;
     const buildSelectOptions = (
       options: ReadonlyArray<{
@@ -112,6 +134,7 @@ export const textOutputLayer = Layer.effect(
         readonly autocompleteThreshold?: number;
         readonly placeholder?: string;
         readonly maxItems?: number;
+        readonly stream?: "stdout" | "stderr";
       } = {},
     ) =>
       Effect.gen(function* () {
@@ -122,6 +145,9 @@ export const textOutputLayer = Layer.effect(
               ? "autocomplete"
               : "select"
             : mode;
+        // clack defaults these to `process.stdout`; only override when a
+        // caller explicitly asks for stderr.
+        const clackOutput = behavior.stream === "stderr" ? process.stderr : undefined;
         const value = yield* Effect.promise(() =>
           effectiveMode === "autocomplete"
             ? autocomplete<string>({
@@ -131,15 +157,20 @@ export const textOutputLayer = Layer.effect(
                   ? { placeholder: behavior.placeholder }
                   : {}),
                 ...(behavior.maxItems !== undefined ? { maxItems: behavior.maxItems } : {}),
+                ...(clackOutput !== undefined ? { output: clackOutput } : {}),
               })
             : select<string>({
                 message,
                 options: buildSelectOptions(options),
                 ...(behavior.maxItems !== undefined ? { maxItems: behavior.maxItems } : {}),
+                ...(clackOutput !== undefined ? { output: clackOutput } : {}),
               }),
         );
         if (isCancel(value)) {
-          cancel("Operation cancelled.");
+          cancel(
+            "Operation cancelled.",
+            clackOutput !== undefined ? { output: clackOutput } : undefined,
+          );
           return yield* Effect.interrupt;
         }
         return value;
@@ -333,42 +364,31 @@ export const textOutputLayer = Layer.effect(
             stop: (msg: string) => Effect.sync(() => bar.stop(msg)),
           };
         }),
+      result: () => Effect.void,
       success: (message: string) => Effect.sync(() => log.success(message)),
       fail: (err: { code: string; message: string; detail?: string; suggestion?: string }) =>
         Effect.sync(() => {
-          // Matches Go's `recoverAndExit` (apps/cli-go/cmd/root.go:300-303): a
+          // Bypasses clack's `log.error` framing (`│` guide + `■` icon): a
           // red-styled message on stderr, optionally followed by a suggestion.
-          // Bypasses clack's `log.error` framing (`│` guide + `■` icon) so the
-          // output byte-matches the Go CLI for parity tests.
           process.stderr.write(styleText("red", err.message) + "\n");
           if (err.detail !== undefined && err.detail !== err.message) {
             process.stderr.write(styleText("gray", err.detail) + "\n");
           }
           if (err.suggestion !== undefined) {
             process.stderr.write(err.suggestion + "\n");
-          } else if (!process.argv.includes("--debug")) {
-            // Go's `utils.SuggestDebugFlag` (apps/cli-go/internal/utils/misc.go:41).
+          } else if (
+            err.message !== CONTEXT_CANCELED_MESSAGE &&
+            !process.argv.includes("--debug")
+          ) {
+            // Withheld for the canceled sentinel: declining a prompt is a
+            // user decision, not something to troubleshoot.
             process.stderr.write(
               "Try rerunning the command with --debug to troubleshoot the error.\n",
             );
           }
         }),
-      raw: (text: string, stream: "stdout" | "stderr" = "stdout") =>
-        Effect.sync(() => {
-          if (stream === "stderr") {
-            process.stderr.write(text);
-          } else {
-            process.stdout.write(text);
-          }
-        }),
-      rawBytes: (bytes: Uint8Array, stream: "stdout" | "stderr" = "stdout") =>
-        Effect.sync(() => {
-          if (stream === "stderr") {
-            process.stderr.write(bytes);
-          } else {
-            process.stdout.write(bytes);
-          }
-        }),
+      raw: (text: string, stream: "stdout" | "stderr" = "stdout") => write(text, stream),
+      rawBytes: (bytes: Uint8Array, stream: "stdout" | "stderr" = "stdout") => write(bytes, stream),
     });
   }),
 );
@@ -377,12 +397,9 @@ export const textOutputLayer = Layer.effect(
 export const jsonOutputLayer = Layer.effect(
   Output,
   Effect.gen(function* () {
-    const stdio = yield* Stdio.Stdio;
-
-    const writeStdout = (s: string) =>
-      Stream.make(s).pipe(Stream.run(stdio.stdout()), Effect.orDie);
-    const writeStderr = (s: string) =>
-      Stream.make(s).pipe(Stream.run(stdio.stderr()), Effect.orDie);
+    const write = stdioWriter(yield* Stdio.Stdio);
+    const writeStdout = (s: string) => write(s, "stdout");
+    const writeStderr = (s: string) => write(s, "stderr");
 
     const nonInteractive = (action: string) =>
       Effect.fail(
@@ -391,6 +408,7 @@ export const jsonOutputLayer = Layer.effect(
           suggestion: "Provide all required values via flags",
         }),
       );
+    const result = (data: unknown) => writeStdout(`${JSON.stringify(data)}\n`);
 
     return Output.of({
       format: "json" as const,
@@ -432,17 +450,17 @@ export const jsonOutputLayer = Layer.effect(
             stop: (msg: string) => writeStderr(`[progress] done: ${msg}\n`),
           };
         }),
-      success: (message: string, data?: Record<string, unknown>) =>
-        writeStdout(JSON.stringify({ ...data, message }) + "\n"),
+      result,
+      success: (message: string, data?: Record<string, unknown>) => result({ ...data, message }),
       fail: (err: { code: string; message: string; detail?: string; suggestion?: string }) =>
-        writeStdout(JSON.stringify({ _tag: "Error", error: err }) + "\n"),
-      raw: (text: string, stream: "stdout" | "stderr" = "stdout") =>
-        stream === "stderr" ? writeStderr(text) : writeStdout(text),
-      rawBytes: (bytes: Uint8Array, stream: "stdout" | "stderr" = "stdout") =>
-        Stream.make(bytes).pipe(
-          Stream.run(stream === "stderr" ? stdio.stderr() : stdio.stdout()),
-          Effect.orDie,
-        ),
+        Effect.gen(function* () {
+          const extra = yield* readMachineErrorContext();
+          // `extra` spreads first so the envelope's own `_tag`/`error` can't
+          // be clobbered by a same-named context field.
+          yield* writeStdout(JSON.stringify({ ...extra, _tag: "Error", error: err }) + "\n");
+        }),
+      raw: (text: string, stream: "stdout" | "stderr" = "stdout") => write(text, stream),
+      rawBytes: (bytes: Uint8Array, stream: "stdout" | "stderr" = "stdout") => write(bytes, stream),
     });
   }),
 );
@@ -451,12 +469,8 @@ export const jsonOutputLayer = Layer.effect(
 export const streamJsonOutputLayer = Layer.effect(
   Output,
   Effect.gen(function* () {
-    const stdio = yield* Stdio.Stdio;
-
-    const writeStdout = (s: string) =>
-      Stream.make(s).pipe(Stream.run(stdio.stdout()), Effect.orDie);
-    const writeStderr = (s: string) =>
-      Stream.make(s).pipe(Stream.run(stdio.stderr()), Effect.orDie);
+    const write = stdioWriter(yield* Stdio.Stdio);
+    const writeStdout = (s: string) => write(s, "stdout");
     const emitLog = (level: "info" | "warn" | "success" | "error", message: string) => {
       const event: StreamEvent = {
         type: "log",
@@ -474,6 +488,14 @@ export const streamJsonOutputLayer = Layer.effect(
           suggestion: "Provide all required values via flags",
         }),
       );
+    const result = (data: unknown) => {
+      const event: StreamEvent = {
+        type: "result",
+        data,
+        timestamp: new Date().toISOString(),
+      };
+      return writeStdout(`${JSON.stringify(event)}\n`);
+    };
 
     return Output.of({
       format: "stream-json" as const,
@@ -523,34 +545,26 @@ export const streamJsonOutputLayer = Layer.effect(
             stop: (msg: string) => emit("done", msg),
           };
         }),
-      success: (message: string, data?: Record<string, unknown>) =>
-        writeStdout(
-          JSON.stringify({
-            type: "result",
-            data: { ...data, message },
+      result,
+      success: (message: string, data?: Record<string, unknown>) => result({ ...data, message }),
+      fail: (err: { code: string; message: string; detail?: string; suggestion?: string }) =>
+        Effect.gen(function* () {
+          const extra = yield* readMachineErrorContext();
+          const event: StreamEvent = {
+            type: "error",
+            error: err,
             timestamp: new Date().toISOString(),
-          }) + "\n",
-        ),
-      fail: (err: { code: string; message: string; detail?: string; suggestion?: string }) => {
-        const event: StreamEvent = {
-          type: "error",
-          error: err,
-          timestamp: new Date().toISOString(),
-        };
-        return writeStdout(JSON.stringify(event) + "\n");
-      },
-      raw: (text: string, stream: "stdout" | "stderr" = "stdout") =>
-        stream === "stderr" ? writeStderr(text) : writeStdout(text),
-      rawBytes: (bytes: Uint8Array, stream: "stdout" | "stderr" = "stdout") =>
-        Stream.make(bytes).pipe(
-          Stream.run(stream === "stderr" ? stdio.stderr() : stdio.stdout()),
-          Effect.orDie,
-        ),
+          };
+          // `extra` spreads first so the event's own `type`/`error`/`timestamp`
+          // can't be clobbered by a same-named context field.
+          yield* writeStdout(JSON.stringify({ ...extra, ...event }) + "\n");
+        }),
+      raw: (text: string, stream: "stdout" | "stderr" = "stdout") => write(text, stream),
+      rawBytes: (bytes: Uint8Array, stream: "stdout" | "stderr" = "stdout") => write(bytes, stream),
     });
   }),
 );
 
-// Select the concrete output policy from the parsed global flag.
 export function outputLayerFor(
   format: OutputFormat,
 ): Layer.Layer<Output, never, Stdio.Stdio | Tty> {

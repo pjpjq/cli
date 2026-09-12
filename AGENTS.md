@@ -1,229 +1,193 @@
 # Supabase
 
-Bun monorepo with workspaces under `apps/` and `packages/`.
+Bun monorepo with workspaces under `apps/` and `packages/`. `pnpm` is the package manager; use
+`pnpm <script>`, never `bun run` or `npm run`.
 
-## Package Manager
+## Workspaces and naming
 
-`pnpm` is the package manager. Use `pnpm <script>` to run scripts from any `package.json`. Do not use `bun run` or `npm run`.
+- `apps/cli` — published `supabase` CLI
+- `apps/docs` — Next.js docs site
+- `packages/api` — typed Management API client
+- `packages/config` — published config schema and generated types
+- `packages/stack` — local Supabase stack runtime
+- `packages/cli-*` — published platform binary wrappers
 
-## Workspace Layout
+Use an existing TypeScript/Bun workspace, especially `packages/api`, as the package-structure
+reference. Published `apps/cli` and `packages/config` are not private; `apps/docs` and
+`packages/cli-*` have their own shapes. Generic lint, format, and unused-code tooling is
+root-owned. Effect lint covers `packages/stack`, all files under
+`apps/cli/src/commands/experimental/stack` and `apps/cli/src/commands/experimental/compute`, the
+shared `apps/cli/src/shared/compute` runtime helpers (excluding embedded starter templates), the
+Compute test fixture helper, and `apps/cli/src/command-internal/experimental-feature.ts`; use the
+root scripts for it.
 
-- `apps/cli` — main `supabase` package
-- `apps/docs` — internal Next.js docs site
-- `packages/api` — typed Supabase Management API client
-- `packages/config` — config schema and generated types
-- `packages/process-compose` — process orchestration library
-- `packages/stack` — programmatic local Supabase stack runtime
-- `packages/cli-*` — platform-specific published CLI binary wrappers
+### Config Naming Vocabulary
 
-## Package Structure
-
-Use `packages/process-compose` as the reference for internal TypeScript/Bun workspaces such as `apps/cli`, `packages/api`, `packages/config`, `packages/process-compose`, and `packages/stack`.
-
-These workspaces should generally follow this structure:
-
-**package.json:**
-
-- `name`: `@supabase/<package-name>`
-- `type`: `"module"`
-- Standard scripts: `test`, `types:check`, `lint:check`, `lint:fix`, `fmt:check`, `fmt:fix`, `knip:check`, `knip:fix`
-- Standard devDependencies: `@tsconfig/bun`, `@types/bun`, `@typescript/native-preview`, `knip`, `oxfmt`, `oxlint`, `oxlint-tsgolint`
-
-Expected exceptions:
-
-- `apps/cli` is published, so it is not `private`
-- `apps/docs` is a Next.js app and does not follow the standard package template
-- `packages/cli-*` are binary wrapper packages and do not follow the standard TypeScript workspace template
-
-**tsconfig.json:**
-
-```json
-{
-  "extends": "@tsconfig/bun/tsconfig.json"
-}
-```
+The config vocabulary is settled: `CliConfig` is the local config document, `ProjectConfig` is
+the hosted-project subset, and `CliSettings` is CLI runtime settings. Use `Cli*` for local
+checkout concepts and bare `Project*` for hosted concepts; helpers follow the family they serve.
+Use a family-neutral name when a symbol deliberately spans both families. See the
+[naming ADR](docs/adr/0020-config-naming-vocabulary.md) and
+[config loading guide](packages/config/docs/cli-config-loading.md) for details, and
+[config instructions](packages/config/AGENTS.md) for its separate release train.
 
 ## Effect
 
-The complete source code for the `effect` library (V4) is in `.repos/effect/`. Study types, APIs, and patterns there instead of `node_modules/`.
+Effect V4 source is in `.repos/effect/`; use it instead of `node_modules`, with core APIs in
+`.repos/effect/packages/effect/`, test helpers in `.repos/effect/packages/vitest/`, and migration
+notes in `.repos/effect/MIGRATION.md`. Run `pnpm repos:install` if it is absent.
 
-If `.repos/effect/` is missing in a fresh clone, run this from the repo root first:
+- Write new TypeScript runtime code in Effect. Internal helpers return Effects; Promise facades
+  belong only at public edges. Wrap a foreign Promise once at its leaf with `Effect.tryPromise`,
+  pass cancellation when supported, and map failures into typed domain errors.
+- Effects are reusable: allocate mutable state per execution (`Effect.suspend`, `Effect.gen`, or
+  scoped acquisition), and keep `Effect.sync` total by using `Effect.try` for throwing thunks.
+- Keep service requirements visible through the type until composition. Provide services with
+  layers or `Effect.provide`; do not hide missing services with casts, nested runtimes, globals,
+  or synchronous adapters.
+- Use `Scope`/`acquireRelease` for resources. Limit `uninterruptibleMask` to the
+  acquisition-to-registration handoff and keep blocking acquisition interruptible with `restore`.
+  Prefer `Effect.forkChild` or scope-owned fibers; detached work needs a documented lifetime and
+  completion path. Use native `Deferred`, `Latch`, `Semaphore`, `Queue`, `PubSub`, `Schedule`,
+  and race or concurrent combinators instead of waiter arrays, polling sleeps, or shared
+  cancellation flags.
+- Shared initialization and teardown are single-flight operations: callers join one cached
+  Effect, fiber, or `Deferred<Exit<...>>`; interrupting one waiter must not cancel shared teardown.
+- `Effect.callback` owns its full foreign lifecycle: register listeners before starting, resume at
+  most once, and on cancellation remove owned listeners and close or destroy the exact resource.
+- Expected failures use typed `Data.TaggedError` and `Effect.fail`; never throw them inside Effect
+  programs. Defects are impossible invariants. Recover with the narrowest `catch` operator; use
+  `catchCause` only when recovery intentionally handles defects or interruption, preserve every
+  other cause, and do not use operational `orDie`/`Layer.orDie`.
+- Preserve `Data.TaggedError` string identities in `apps/cli/src` and `packages/config/src` when
+  renaming classes; class names may change, but tags must remain stable. See the CLI
+  [telemetry identity rule](apps/cli/AGENTS.md#telemetry).
+- Use public helpers (`Exit.isSuccess`, `Option.isSome`, `Cause.isTimeoutError`, and similar) and
+  exhaustive `Match`/predicate helpers for domain variants. Raw `._tag` is for schema/type
+  definitions, serialization, or genuinely dynamic boundaries only.
+- Compose schemas with `decodeUnknownEffect`, `decodeEffect`, and `encodeEffect`, mapping
+  `SchemaError` into domain errors. Sync codecs are acceptable only at an explicitly synchronous,
+  service-free edge that intentionally throws.
+
+### Effect linting
+
+- Fix the underlying design when Effect lint reports a violation. Refactor to native
+  Effect constructs; do not silence findings with `oxlint-disable`, casts, file
+  exclusions, or weaker lint configuration.
+- A suppression is acceptable only for a demonstrated false positive or an unavoidable
+  foreign-library boundary. Before retaining one, inspect the corresponding Effect API
+  and identify the specific missing capability or behavior that prevents replacement;
+  existing Promise-based code, native API usage, or refactoring effort alone do not
+  justify an exception. Limit it to the specific rule and smallest scope, and explain
+  why a compliant implementation is not possible.
+- Passing lint by bypassing its rules does not complete an Effect migration.
+
+## Commands, validation, and workflows
+
+Package scripts are the source of truth for leaf workspaces; root-owned Turbo coordinates build,
+generation, quality, live, and auxiliary workflows. Inspect dependencies with
+`pnpm exec turbo run <task> --dry=json`.
+
+Keep the local feedback loop fast; full CI runs for ready PRs targeting `develop`.
+
+- Documentation-only edits need formatting and reference checks. Code changes need relevant
+  type/lint checks and affected unit/integration tests, using package scripts and root-owned tools.
+- Before pushing, run formatting and applicable lint checks on all changed files and fix any
+  findings in those files.
+- Broaden checks when shared behavior or runtime wiring changes warrant it, or when requested.
+  Run targeted E2E when the subprocess boundary matters; run full E2E only on explicit request.
+- Repeat checks only after changes or failures that could affect their result.
+- Fix failures caused by the change and report any unresolved validation blockers. Investigate
+  unexpected failures without automatically expanding the task into unrelated repairs.
+
+Use `pnpm test` only when its scope fits the change; the CLI's aggregate script includes full E2E,
+so use `pnpm run test:unit` and `pnpm run test:integration` with affected test files locally.
+When repo-wide validation is warranted, use root `pnpm check:all` or `pnpm fix:all`. These are the
+repo-wide quality entrypoints: `check:all` runs generic and Effect lint, format, knip, and type
+checks; `fix:all` applies generic and Effect lint, format, and knip fixes. Do not use production
+`as` casts to silence type errors.
+
+Use root Turbo entrypoints for live and auxiliary workflows:
 
 ```sh
-pnpm repos:install
+pnpm run build
+pnpm run generate
+pnpm exec turbo run supabase#build
+pnpm run test:live
 ```
 
-Key references:
+## Comments
 
-- `.repos/effect/packages/effect/` — core `effect` library
-- `.repos/effect/packages/vitest/` — `@effect/vitest` test helpers
-- `.repos/effect/MIGRATION.md` — V3 to V4 migration guide
+Comments exist for the next reader, not as the author's audit trail. Code states what happens; a
+comment states only the why that the code cannot carry. Most code needs no comment at all.
 
-## Code Quality
+### When to comment
 
-Run quality checks from the workspace directory you changed. Do not consider a task complete until all relevant scripts pass.
-Do not waive or defer failing checks in a changed workspace as "pre-existing". If a required check fails, fix it before closing the task. Only treat a failure as an external blocker when it cannot be resolved within the workspace, and in that case call it out explicitly.
-If you run a workspace check command such as `pnpm types:check && pnpm lint:check && pnpm fmt:check`, you own all failing checks in that workspace for the duration of the task, even if the failing files look unrelated. Do not leave the workspace with unresolved failing checks after running the command.
-Do not use TypeScript `as` casts to silence type errors in production code. If a type does not line up, fix the typing or restructure the code until it type-checks cleanly.
+Write a comment only for an invariant or constraint the types cannot express, an external quirk,
+a decision that would otherwise read as a bug, or a pointer to an ADR, `SIDE_EFFECTS.md`, docs
+page, or upstream issue. If the rationale needs more than three lines, move it to documentation.
 
-For the standard Bun/TypeScript workspaces:
+### How to comment
 
-```sh
-pnpm check:all
-pnpm lint:fix && pnpm fmt:fix
-pnpm test
-```
+- Prefer one sentence of JSDoc on exported symbols; use tags such as `@deprecated` and `@see` when they carry useful meaning.
+- Skip JSDoc on self-explanatory internal helpers and keep inline comments to one or two lines.
+- Describe behavior in its own terms and in the present tense.
+- Published package exports need a one-line JSDoc summary. This public repository must not include internal context in comments.
 
-If a workspace exposes a different script set, use that workspace's `package.json` as the source of truth.
+### Never write
 
-## Nx
+- Code narration, provenance/history, evidence trails, ticket IDs as provenance, or meta-commentary on code shape. A ticket ID belongs only in a `TODO(CLI-1234):` or when no ADR exists and the ticket is the only home for a decision.
+- Restatements of docs, section banners, or Go-parity framing. Link to maintained docs instead.
+- ALL-CAPS emphasis or words such as “deliberately”, “crucially”, and “exactly”.
 
-This repo uses Nx for task orchestration. Prefer Nx commands over running scripts directly when working across projects or when you need to understand project structure.
+Tests should carry intent in their names; comments only explain non-obvious fixture setup. Keep
+tool directives and tool-facing JSDoc tags, and give every lint disable a short reason after `--`.
+A source file whose comment lines exceed a quarter of its code lines should move prose into docs.
 
-### Exploring the workspace
+## Pull requests
 
-```sh
-# List all projects
-nx show projects
+Use conventional-commit titles: `<type>(<scope>): <subject>`. Valid scopes are listed in
+[`commitlint.config.js`](commitlint.config.js); keep its list synchronized with the mirrored
+scope list in [the PR lint workflow](.github/workflows/lint-pull-request.yml). Non-release changes use `chore`, `docs`, `test`,
+or `ci` rather than release-triggering types. Do not put validation,
+test plans, or check lists in PR descriptions. Public PRs, issues, and code comments must omit
+internal metrics (percentages, ratios, or relative changes are fine), vendor/legal/pricing/strategy
+details, and competitor names; protocol identifiers such as user-agent strings are fine. Keep
+internal context in Linear.
 
-# Show targets and metadata for a specific project
-nx show project <name> --json
+## Refactoring
 
-# Visualize the project dependency graph
-nx graph
-```
+Internal unreleased APIs may be simplified or reshaped; move responsibility to the correct owner
+and delete obsolete helpers, shims, and parallel paths instead of preserving compatibility
+scaffolding. Protect shipped interfaces and valuable persistent data; update consumers, tests, and
+docs when interfaces, ownership, or lifecycle changes.
 
-### Running tasks
+## Test quality
 
-```sh
-# Run a single target
-nx run <project>:<target>
+- Write focused tests that read as stories: arrange, act, assert.
+- Assert behavior that matters to consumers, not implementation details. Prefer real parsers and observable outcomes over source-text or registry checks.
+- Make assertions meaningful: establish prerequisites, check specific failures, and choose matchers that express the intended contract.
+- Keep setup concise with small fixtures. Accept some duplication rather than introducing unnecessary test abstractions.
+- Remove redundant coverage. Push back on review suggestions that add assertions without protecting meaningful behavior.
 
-# Run a target across all projects
-nx run-many -t <target>
+Name tests `*.unit.test.ts`, `*.integration.test.ts`, or `*.e2e.test.ts`; colocate them with source.
+Use `tests/` for shared helpers. For CLI commands, unit-test complex pure logic, integration-test
+handlers and feature matrices with realistic Effect layers, and reserve E2E for one to three
+golden-path subprocess workflows. Handler integration is the default for command behavior. Use
+`@effect/vitest`'s `it.live` with stateful mock factories returning `{ layer, state }`;
+assert resulting state and user-visible behavior, not `vi.fn()` call details. See
+[`login.integration.test.ts`](apps/cli/src/commands/login/login.integration.test.ts) and
+[`login.e2e.test.ts`](apps/cli/src/commands/login/login.e2e.test.ts); E2E uses
+[`tests/helpers/cli.ts`](apps/cli/tests/helpers/cli.ts) and `runSupabase()`.
 
-# Run a target only on projects affected by current changes
-nx affected -t <target>
+Keep tests flake-resistant:
 
-# Run multiple targets (e.g. build + test)
-nx run-many -t build test
-```
+- Subscribe before triggering a transition; use observable readiness/completion, never sleeps or polling delays for propagation, startup, cancellation, cleanup, or port release. Timeouts are guards; use TestClock or fake timers for timing semantics.
+- Assume file-level parallelism: use unique IDs, roots, process markers, and derived resources; never disable parallelism globally.
+- Never release and reuse an ephemeral port or assume a released endpoint is a dead backend; own a refusal listener or inject the failure.
+- Require subprocess readiness and stdout/stderr diagnostics; clean up only exact owned resources. Reproduce and stress flake fixes, then repeat the green case.
 
-Use `nx show project <name> --json` to discover available targets before running them — do not guess target names.
+## Maintaining instructions
 
-## Pull Requests
-
-PR titles must follow conventional-commits format because the `Lint Pull Request` workflow runs `amannn/action-semantic-pull-request` against the title. Use `<type>(<scope>): <subject>` (e.g. `fix(cli): …`, `test(cli): …`, `feat(api): …`). A bare descriptive title like "Build TypeScript CLI as compiled Bun binaries" will fail the lint. When a PR is created (including by the Claude Code UI or someone else), check the title against this rule and update it if needed.
-Avoid semantic-release-triggering types for non-release changes. For CI, docs, tests, tooling, agent instructions, and other repository-maintenance changes, do not use `fix`, `feat`, `perf`, or breaking-change markers just to satisfy the PR title linter. Prefer non-releasing conventional types such as `chore`, `docs`, `test`, or `ci` when the change should not produce a package release.
-Do not include a validation, test plan, or list of checks in PR descriptions. CI enforces validation for PRs, so PR descriptions should focus on what changed, why it changed, and any reviewer-relevant context that CI cannot infer.
-
-## Refactoring Policy
-
-None of this code is published as a stable internal platform API, so backward compatibility is not a constraint. Prefer the simplest correct design, including substantial refactors, API reshaping, and deleting obsolete code when it improves the codebase.
-When a cleaner architecture is available, prefer moving responsibilities to the correct owner over layering callbacks, adapters, or transitional state into an existing facade.
-Do not preserve inaccurate, leaky, or compromise-driven internal APIs just to avoid updating call sites in the same change.
-Delete obsolete helpers, shims, and parallel code paths as part of the refactor instead of leaving compatibility scaffolding behind.
-When a refactor changes ownership, interfaces, or lifecycle boundaries, update the relevant tests and docs in the same task.
-
-## Testing
-
-See `apps/cli/src/commands/login/` as the canonical example.
-
-### File naming
-
-- `*.unit.test.ts` — unit tests, colocated next to source
-- `*.integration.test.ts` — integration tests, colocated next to source
-- `*.e2e.test.ts` — end-to-end tests, colocated next to source
-- `tests/` — shared test helpers (for example `tests/helpers/cli.ts`)
-
-### Testing pyramid for CLI commands
-
-1. **Unit tests** on `lib/` — reserved for pure logic and complicated algorithms that benefit from very tight, fast coverage
-2. **Integration tests** on handlers — the default place for almost all command behavior, including parsing, normalization, output shaping, fallback behavior, error mapping, and feature matrix coverage, with mocked Effect services via `Layer.succeed`
-3. **E2e tests** — a very small golden-path surface only, usually 1 to 3 tests for the most critical subprocess/runtime workflows
-
-### E2e scope policy
-
-- Treat e2e coverage as scarce and expensive. Keep it focused on the most critical user workflows and happy-path smoke coverage.
-- Prefer integration tests for everything that does not require a real subprocess, real runtime wiring, or real cross-boundary behavior.
-- Do not use e2e tests for help text, argument normalization, dry-run payloads, schema rendering, projection formatting, or similar detail coverage unless the real subprocess boundary itself is the thing being validated.
-- If an assertion can be expressed faithfully in an integration test, it should generally live there instead of in e2e.
-- When in doubt, move coverage down the pyramid: e2e -> integration -> unit.
-
-### Test execution policy
-
-- Always run unit and integration tests for the workspace you changed before considering the task done.
-- Do not automatically run the full e2e suite as part of the normal feedback loop.
-- Run e2e tests only when the user asks for them, or when you specifically need them for the command you touched.
-- When you do run e2e tests automatically, run only the targeted e2e file(s) for the command you changed, not unrelated e2e tests.
-
-### Integration test pattern
-
-Uses `@effect/vitest` with `it.live` — stateful mock factories return `{ layer, state }`. Avoid `vi.fn()` spies; assert on accumulated state after the effect runs:
-
-- Integration tests for CLI commands should be high-level and scenario-oriented.
-- Prefer realistic user flows and user-intent test names over implementation-branch test names.
-- Assert primarily on user-visible behavior and resulting state, not on internal call ordering.
-- Use command-scoped setup helpers that return `{ layer, out, ...state }` so the tests read like command scenarios instead of DI assembly.
-- If a test is mostly validating a pure transformation, formatter, schema descriptor, or other implementation detail, it should usually be a unit test instead.
-
-```ts
-import { describe, expect, it } from "@effect/vitest";
-import { Effect, Exit, Layer } from "effect";
-
-function mockCredentials(opts: { existingToken?: string } = {}) {
-  let savedToken: string | undefined;
-  return {
-    layer: Layer.succeed(Credentials, {
-      getAccessToken: Effect.sync(() => opts.existingToken ?? savedToken),
-      saveAccessToken: (token: string) =>
-        Effect.sync(() => {
-          savedToken = token;
-        }),
-    }),
-    get savedToken() {
-      return savedToken;
-    },
-  };
-}
-
-function setupTty(opts = {}) {
-  const creds = mockCredentials(opts);
-  const out = mockOutput(opts);
-  const api = mockApi(opts);
-  const layer = Layer.mergeAll(emptyEnv(), api.layer, creds.layer, mockCrypto(), ...);
-  return { layer, creds, out, api };
-}
-
-it.live("saves the token on login", () => {
-  const { layer, creds, out } = setupTty();
-  return Effect.gen(function* () {
-    yield* login(args);
-    expect(creds.savedToken).toBe(VALID_TOKEN);
-    expect(out.messages).toContainEqual(
-      expect.objectContaining({ type: "success", message: "Logged in successfully." }),
-    );
-  }).pipe(Effect.provide(layer));
-});
-
-it.live("fails with SomeError", () => {
-  const { layer } = setupTty();
-  return Effect.gen(function* () {
-    const exit = yield* myEffect(args).pipe(Effect.exit);
-    expect(Exit.isFailure(exit)).toBe(true);
-  }).pipe(Effect.provide(layer));
-});
-```
-
-### E2e test pattern
-
-Use the `runSupabase()` helper from `tests/helpers/cli.ts`, which spawns a real CLI subprocess with an isolated temp HOME:
-
-```ts
-import { describe, expect, test } from "vitest";
-import { runSupabase } from "../../tests/helpers/cli.ts";
-
-const { stdout, stderr, exitCode } = await runSupabase(["login", "--token", token]);
-expect(exitCode).toBe(0);
-expect(stdout).toContain("Logged in successfully");
-```
+Add instructions only for recurring mistakes or non-obvious repository constraints. Update an
+existing rule before adding another; prefer links to maintained sources over copied examples.

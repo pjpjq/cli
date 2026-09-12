@@ -94,12 +94,11 @@ var (
 	PgmetaVersionPath    = filepath.Join(TempDir, "pgmeta-version")
 	PoolerVersionPath    = filepath.Join(TempDir, "pooler-version")
 	RealtimeVersionPath  = filepath.Join(TempDir, "realtime-version")
-	PgDeltaVersionPath   = filepath.Join(TempDir, "pgdelta-version")
 	CliVersionPath       = filepath.Join(TempDir, "cli-latest")
 	CurrBranchPath       = filepath.Join(SupabaseDirPath, ".branches", "_current_branch")
 	// DeclarativeDir is the canonical location for pg-delta declarative schema
 	// files generated or synced by `supabase db schema declarative` commands.
-	DeclarativeDir        = filepath.Join(SupabaseDirPath, "database")
+	DeclarativeDir        = filepath.Join(SupabaseDirPath, "schemas")
 	ClusterDir            = filepath.Join(SupabaseDirPath, "cluster")
 	SchemasDir            = filepath.Join(SupabaseDirPath, "schemas")
 	MigrationsDir         = filepath.Join(SupabaseDirPath, "migrations")
@@ -129,7 +128,14 @@ func IsPgDeltaEnabled() bool {
 
 func GetCurrentTimestamp() string {
 	// Magic number: https://stackoverflow.com/q/45160822.
-	return time.Now().UTC().Format(layoutVersion)
+	return GetVersionTimestamp(time.Now())
+}
+
+// GetVersionTimestamp formats t as a migration version (UTC `YYYYMMDDHHMMSS`).
+// Callers that write several ordered migration files in one pass add real time
+// offsets to a shared base rather than incrementing the formatted string.
+func GetVersionTimestamp(t time.Time) string {
+	return t.UTC().Format(layoutVersion)
 }
 
 func GetCurrentBranchFS(fsys afero.Fs) (string, error) {

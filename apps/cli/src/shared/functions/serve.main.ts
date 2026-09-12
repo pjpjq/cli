@@ -46,6 +46,18 @@ const DENO_SB_ERROR_MAP = new Map([
   [Deno.errors.WorkerRequestCancelled, SB_SPECIFIC_ERROR_CODE.WorkerLimit],
 ]);
 const GENERIC_FUNCTION_SERVE_MESSAGE = `Serving functions on http://127.0.0.1:${HOST_PORT}/functions/v1/<function-name>`;
+export enum RequestErrors {
+  MissingAuthHeader = "UNAUTHORIZED_NO_AUTH_HEADER",
+  InvalidLegacyJWT = "UNAUTHORIZED_JWT",
+  InvalidAsymmetricJWT = "UNAUTHORIZED_ASYMMETRIC_JWT",
+  InvalidTokenFormat = "UNAUTHORIZED_INVALID_JWT_FORMAT",
+  UnsupportedTokenAlgorithm = "UNAUTHORIZED_UNSUPPORTED_TOKEN_ALGORITHM",
+}
+
+interface AuthFailure {
+  code: RequestErrors;
+  message?: string;
+}
 
 interface FunctionConfig {
   entrypointPath: string;
@@ -74,12 +86,34 @@ function getResponse(payload: any, status: number, customHeaders = {}) {
   return new Response(body, { status, headers });
 }
 
+function getAuthErrorResponse({ code, message = "Invalid JWT" }: AuthFailure) {
+  return getResponse(
+    {
+      code,
+      message,
+      // DEPRECATED: Retained for backward compatibility.
+      msg: message,
+    },
+    STATUS_CODE.Unauthorized,
+    {
+      "sb-error-code": code,
+      "Access-Control-Expose-Headers": "sb-error-code",
+    },
+  );
+}
+
 const functionsConfig: Record<string, FunctionConfig> = (() => {
   try {
     const functionsConfig = JSON.parse(FUNCTIONS_CONFIG_STRING);
 
     if (DEBUG) {
-      console.log("Functions config:", JSON.stringify(functionsConfig, null, 2));
+      const debugConfig = Object.fromEntries(
+        Object.entries(functionsConfig).map(([name, config]) => [
+          name,
+          Object.fromEntries(Object.entries(config).filter(([key]) => key !== "env")),
+        ]),
+      );
+      console.log("Functions config:", JSON.stringify(debugConfig, null, 2));
     }
 
     return functionsConfig;
@@ -88,7 +122,30 @@ const functionsConfig: Record<string, FunctionConfig> = (() => {
   }
 })();
 
-/* --- JWT verification --- */
+// Edge Runtime pools user workers by servicePath. Keep the source directory
+// for the common case, but give each function a process-owned temporary
+// path when multiple configured functions share that directory, since a
+// real function directory can't be reused as a pool key. `maybeEntrypoint`
+// still points at the real source file, so module resolution is unchanged.
+const workerServicePaths = (() => {
+  const sourcePathCounts = new Map<string, number>();
+  for (const config of Object.values(functionsConfig)) {
+    const sourcePath = dirname(config.entrypointPath);
+    sourcePathCounts.set(sourcePath, (sourcePathCounts.get(sourcePath) ?? 0) + 1);
+  }
+
+  return Object.fromEntries(
+    Object.entries(functionsConfig).map(([functionName, config]) => {
+      const sourcePath = dirname(config.entrypointPath);
+      const servicePath =
+        sourcePathCounts.get(sourcePath) === 1
+          ? sourcePath
+          : Deno.makeTempDirSync({ prefix: "supabase-worker-" });
+      return [functionName, servicePath];
+    }),
+  );
+})();
+
 export function extractBearerToken(rawToken: string) {
   const tokenParts = rawToken.split(" ");
   const [bearer, token] = tokenParts;
@@ -99,41 +156,46 @@ export function extractBearerToken(rawToken: string) {
   return token;
 }
 
-function getAuthToken(req: Request) {
+function getAuthToken(req: Request): string | AuthFailure {
   const authHeader = req.headers.get("authorization");
   const sbApiKeyCompatibilityToken = req.headers.get("sb-api-key");
 
-  // NOTE:(kallebysantos) Kong on legacy CLI stack pass it down as 'Bearer Token' format
+  // Kong on the CLI stack passes this down as "Bearer Token" format.
   const cleanSbApiKeyCompatibilityToken = sbApiKeyCompatibilityToken?.replace("Bearer", "")?.trim();
 
   if (!authHeader && !cleanSbApiKeyCompatibilityToken) {
-    throw new Error("Missing authorization header");
+    return {
+      code: RequestErrors.MissingAuthHeader,
+      message: "Missing authorization header",
+    };
   }
 
-  // NOTE:(kallebysantos) Compatibility mode is triggered when all conditions match:
-  // - API proxy mints a temp token
-  // - Original bearer is not present or is ApiKey
+  // Compatibility mode triggers when the API proxy mints a temp token and
+  // the original bearer is absent or an API key.
   const bearerToken = extractBearerToken(authHeader ?? "");
   const token =
     !bearerToken || bearerToken.startsWith("sb_") ? cleanSbApiKeyCompatibilityToken : bearerToken;
 
   if (!token) {
-    throw new Error(`Auth header is not 'Bearer {token}'`);
+    return {
+      code: RequestErrors.InvalidTokenFormat,
+      message: "Invalid JWT format",
+    };
   }
 
   return token;
 }
 
-async function isValidLegacyJWT(jwtSecret: string, jwt: string): Promise<boolean> {
+async function isValidLegacyJWT(jwtSecret: string, jwt: string): Promise<AuthFailure | null> {
   const encoder = new TextEncoder();
   const secretKey = encoder.encode(jwtSecret);
   try {
     await jose.jwtVerify(jwt, secretKey);
   } catch (e) {
     console.error("Symmetric Legacy JWT verification error", e);
-    return false;
+    return { code: RequestErrors.InvalidLegacyJWT };
   }
-  return true;
+  return null;
 }
 
 // Lazy-loading JWKs
@@ -146,7 +208,7 @@ let jwks = (() => {
   }
 })();
 
-async function isValidJWT(jwksUrl: URL, jwt: string): Promise<boolean> {
+async function isValidJWT(jwksUrl: URL, jwt: string): Promise<AuthFailure | null> {
   try {
     if (!jwks) {
       // Loading from remote-url on fly
@@ -155,9 +217,9 @@ async function isValidJWT(jwksUrl: URL, jwt: string): Promise<boolean> {
     await jose.jwtVerify(jwt, jwks);
   } catch (e) {
     console.error("Asymmetric JWT verification error", e);
-    return false;
+    return { code: RequestErrors.InvalidAsymmetricJWT };
   }
-  return true;
+  return null;
 }
 
 /**
@@ -168,8 +230,24 @@ export async function verifyHybridJWT(
   jwtSecret: string,
   jwksUrl: URL,
   jwt: string,
-): Promise<boolean> {
-  const { alg: jwtAlgorithm } = jose.decodeProtectedHeader(jwt);
+): Promise<AuthFailure | null> {
+  let jwtAlgorithm: string | undefined;
+  try {
+    jwtAlgorithm = jose.decodeProtectedHeader(jwt).alg;
+  } catch (e) {
+    console.error("JWT format error", e);
+    return {
+      code: RequestErrors.InvalidTokenFormat,
+      message: "Invalid JWT format",
+    };
+  }
+
+  if (!jwtAlgorithm) {
+    return {
+      code: RequestErrors.InvalidTokenFormat,
+      message: "Invalid JWT format",
+    };
+  }
 
   if (jwtAlgorithm === "HS256") {
     console.log(`Legacy token type detected, attempting ${jwtAlgorithm} verification.`);
@@ -181,7 +259,10 @@ export async function verifyHybridJWT(
     return await isValidJWT(jwksUrl, jwt);
   }
 
-  return false;
+  return {
+    code: RequestErrors.UnsupportedTokenAlgorithm,
+    message: `Unsupported JWT algorithm ${jwtAlgorithm}`,
+  };
 }
 
 // Ref: https://docs.deno.com/examples/checking_file_existence/
@@ -209,7 +290,6 @@ export function prepareUserRequest(req: Request): Request {
   clonedURL.hostname = forwardedHost ?? clonedURL.hostname;
   const clonedReq = new Request(clonedURL, req.clone());
 
-  // remove custom api headers
   clonedReq.headers.delete("sb-api-key");
   EdgeRuntime.applySupabaseTag(req, clonedReq);
 
@@ -221,12 +301,10 @@ Deno.serve({
     const url = new URL(req.url);
     const { pathname } = url;
 
-    // handle health checks
     if (pathname === "/_internal/health") {
       return getResponse({ message: "ok" }, STATUS_CODE.OK);
     }
 
-    // handle metrics
     if (pathname === "/_internal/metric") {
       const metric = await EdgeRuntime.getRuntimeMetrics();
       return Response.json(metric);
@@ -242,18 +320,23 @@ Deno.serve({
     if (req.method !== "OPTIONS" && functionsConfig[functionName].verifyJWT) {
       try {
         const token = getAuthToken(req);
-        const isValidJWT = await verifyHybridJWT(JWT_SECRET, JWKS_ENDPOINT, token);
-
-        if (!isValidJWT) {
-          return getResponse({ msg: "Invalid JWT" }, STATUS_CODE.Unauthorized);
+        if (typeof token !== "string") {
+          return getAuthErrorResponse(token);
+        }
+        const authFailure = await verifyHybridJWT(JWT_SECRET, JWKS_ENDPOINT, token);
+        if (authFailure) {
+          return getAuthErrorResponse(authFailure);
         }
       } catch (e) {
         console.error(e);
-        return getResponse({ msg: e.toString() }, STATUS_CODE.Unauthorized);
+        return getAuthErrorResponse({
+          code: RequestErrors.InvalidTokenFormat,
+          message: "Invalid JWT format",
+        });
       }
     }
 
-    const servicePath = dirname(functionsConfig[functionName].entrypointPath);
+    const servicePath = workerServicePaths[functionName];
     console.error(`serving the request with ${servicePath}`);
 
     // Ref: https://supabase.com/docs/guides/functions/limits
@@ -264,9 +347,11 @@ Deno.serve({
       ...Deno.env.toObject(),
       ...Object.fromEntries(
         Object.entries(functionsConfig[functionName].env ?? {}).filter(
-          ([name, _]) => !name.startsWith("SUPABASE_"),
+          ([name]) => !name.startsWith("SUPABASE_"),
         ),
       ),
+      // Listed after the spreads so neither the container env nor function config can shadow it
+      SUPABASE_FUNCTION_SLUG: functionName,
     };
     if (SUPABASE_PUBLISHABLE_KEY) {
       envVarsObj["SUPABASE_PUBLISHABLE_KEYS"] = JSON.stringify({
@@ -280,7 +365,7 @@ Deno.serve({
     }
 
     const envVars = Object.entries(envVarsObj).filter(
-      ([name, _]) => !EXCLUDED_ENVS.includes(name) && !name.startsWith("SUPABASE_INTERNAL_"),
+      ([name]) => !EXCLUDED_ENVS.includes(name) && !name.startsWith("SUPABASE_INTERNAL_"),
     );
 
     const forceCreate = false;
@@ -288,10 +373,7 @@ Deno.serve({
     const cpuTimeSoftLimitMs = 1000;
     const cpuTimeHardLimitMs = 2000;
 
-    // NOTE(Nyannyacha): Decorator type has been set to tc39 by Lakshan's request,
-    // but in my opinion, we should probably expose this to customers at some
-    // point, as their migration process will not be easy.
-    // This need to be kept for Deno 1 compatibility.
+    // Kept as "tc39" for Deno 1 compatibility.
     const decoratorType = "tc39";
 
     const absEntrypoint = join(Deno.cwd(), functionsConfig[functionName].entrypointPath);
@@ -342,7 +424,6 @@ Deno.serve({
         {
           code: STATUS_TEXT[STATUS_CODE.InternalServerError],
           message: "Request failed due to an internal server error",
-          trace: JSON.stringify(e.stack),
         },
         STATUS_CODE.InternalServerError,
       );
@@ -378,11 +459,11 @@ Deno.serve({
   },
 
   onError: (e) => {
+    console.error(e);
     return getResponse(
       {
         code: STATUS_TEXT[STATUS_CODE.InternalServerError],
         message: "Request failed due to an internal server error",
-        trace: JSON.stringify(e.stack),
       },
       STATUS_CODE.InternalServerError,
     );

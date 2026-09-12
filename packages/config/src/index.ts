@@ -1,41 +1,77 @@
-export { ProjectConfigSchema, type ProjectConfig, type ProjectConfigJson } from "./base.ts";
+/**
+ * Pure, browser/edge-safe entrypoint. Must never export an Effect-returning
+ * function, nor pull `@effect/platform-*` or `node:`/`bun:` modules into its
+ * transitive graph. Effect-core `FileSystem`/`Path` TAG references reachable
+ * from this graph are fine — they're inert without a platform layer provided.
+ * File IO and Effect-native services live at `@supabase/config/io` and
+ * `@supabase/config/effect`.
+ */
 export {
+  CliConfigSchema,
+  toCliConfigJsonSchema,
+  type CliConfig,
+  type CliConfigJson,
+} from "./base.ts";
+export {
+  CliConfigParseError,
+  CliProjectEnvParseError,
   DuplicateRemoteProjectIdError,
-  MissingProjectConfigValueError,
+  InvalidRemoteProjectIdError,
   ProjectConfigParseError,
-  ProjectEnvParseError,
 } from "./errors.ts";
+export type { ConfigFormat } from "./config-format.ts";
 export {
-  type ConfigFormat,
-  type LoadedProjectConfig,
-  type LoadProjectConfigOptions,
-  type SaveProjectConfigOptions,
-  configJsonPath,
-  configTomlPath,
-  encodeProjectConfigToJson,
-  encodeProjectConfigToToml,
-  loadProjectConfig,
-  loadProjectConfigFile,
-  saveProjectConfig,
-} from "./io.ts";
+  type LoadedCliConfig,
+  type LoadCliConfigOptions,
+  type CliConfigValueOrigin,
+  type CliConfigValueSource,
+  type SaveCliConfigOptions,
+  encodeCliConfigToJson,
+  encodeCliConfigToToml,
+  cliConfigValueSourceAt,
+} from "./config-document.ts";
 export {
   edgeFunctionDenoConfigFileName,
   edgeFunctionEntrypointFileName,
   edgeFunctionsDirectoryName,
   type FunctionsManifest,
   type ResolvedFunctionConfig,
-  inferFunctionsManifest,
-} from "./functions-manifest.ts";
+} from "./functions-manifest-model.ts";
+export type { LoadCliProjectEnvironmentOptions, CliProjectEnvironment } from "./project.ts";
 export {
-  type LoadProjectEnvironmentOptions,
-  type ProjectEnvironment,
-  type ResolvedProjectValue,
-  loadProjectEnvironment,
-  resolveProjectSubtree,
-  resolveProjectValue,
-} from "./project.ts";
-export { type ProjectPaths, findProjectPaths, findProjectRoot } from "./paths.ts";
-export { projectConfigStoreLayer } from "./project-config.layer.ts";
-export { ProjectConfigStore } from "./project-config.service.ts";
-export { PROJECT_CONFIG_SCHEMA_URL } from "./schema-metadata.ts";
-export { KONG_LOCAL_CA_CERT } from "./tls.ts";
+  type ResolvedCliConfigValue,
+  resolveCliConfigValue,
+  resolveCliConfigSubtree,
+} from "./lib/resolve.ts";
+export type { CliProjectPaths } from "./paths.ts";
+export { CLI_CONFIG_SCHEMA_URL, PROJECT_CONFIG_SCHEMA_URL } from "./schema-metadata.ts";
+export {
+  type EffectiveConfig,
+  type SparseCliConfig,
+  getDefaultCliConfig,
+  omitDefaultValues,
+  subtractCliConfig,
+} from "./sparse.ts";
+export {
+  type CliConfigWithRawPresence,
+  type ConfigAbsencePolicy,
+  type ProjectConfig,
+  type ReadonlyJsonValue,
+  type ToProjectConfigSource,
+  attachApiResponse,
+  comparableProjectConfigPaths,
+  fromApiProjectConfig,
+  fromConfigDocument,
+  isComparableProjectConfigPath,
+  toProjectConfig,
+  unmappedApiFields,
+} from "./project-config/project-config.ts";
+export { ProjectConfigSchema, toProjectConfigJsonSchema } from "./project-config/project-schema.ts";
+export {
+  type ConfigChange,
+  type ConfigChangeClass,
+  type ConfigChangeCounts,
+  type ConfigChangeSet,
+  type DiffProjectConfigOptions,
+  diffProjectConfig,
+} from "./config-diff.ts";

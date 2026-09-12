@@ -10,7 +10,7 @@ import * as SchemaRepresentation from "effect/SchemaRepresentation";
 type HttpMethod = "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD";
 type OpenApiHttpMethod = Lowercase<HttpMethod>;
 
-type OpenApiDocument = {
+export type OpenApiDocument = {
   readonly openapi: string;
   readonly info?: {
     readonly title?: string;
@@ -22,7 +22,7 @@ type OpenApiDocument = {
   };
 };
 
-type OpenApiOperation = {
+export type OpenApiOperation = {
   readonly operationId?: string;
   readonly summary?: string;
   readonly description?: string;
@@ -111,6 +111,8 @@ type OperationDefinition = {
   readonly schemaBase: string;
   readonly method: HttpMethod;
   readonly path: string;
+  readonly version: string;
+  readonly methodName: string;
   readonly description: string;
   readonly pathParams: ReadonlyArray<string>;
   readonly queryParams: ReadonlyArray<string>;
@@ -142,7 +144,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
-function loadSpec(): OpenApiDocument {
+export function loadSpec(): OpenApiDocument {
   const parsed = JSON.parse(readFileSync(sourceSpecPath, "utf8"));
   if (!isRecord(parsed) || !isRecord(parsed.paths)) {
     throw new Error(`Invalid OpenAPI document at ${sourceSpecPath}`);
@@ -204,41 +206,53 @@ function identifier(value: string): string {
   return camel[0] ? camel[0].toUpperCase() + camel.slice(1) : camel;
 }
 
-// OpenAPI 3.0 treats `format: "uuid"` as a hint, not validation. Without a
-// concrete `pattern`, the resulting Effect schema's UUID branch has no check,
-// so a 20-letter project ref matches both branches of `oneOf [project-ref, uuid]`
-// unions (e.g. `branch_id_or_ref`) and validation fails at "Expected exactly one
-// member to match". Add the canonical RFC 4122 pattern so the branches become
-// mutually exclusive. Mirrored by an inline patch in `contracts.ts` (search
-// "Patched: OpenAPI's `format: \"uuid\"`") that survives ad-hoc edits between
-// regenerations.
+// OpenAPI's `format: "uuid"` is a hint, not validation, so a project-ref string
+// can match both branches of a `oneOf [project-ref, uuid]` union unless a
+// concrete pattern is added; kept in sync with contracts.ts's inline uuid patch.
 const UUID_PATTERN =
   "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$";
 
-// Keys that we want to strip from a schema node because they describe
-// documentation / example values rather than the value's shape. JSON Schema's
-// `default` is a primitive (or array/object) literal used for documentation —
-// not part of the type contract — so we drop it during sanitization to keep
-// the generated Effect schema lean.
+// Keys stripped from a schema node because they describe documentation/example
+// values, not the value's shape.
 const SCHEMA_METADATA_KEYS = new Set(["default", "example", "examples"]);
 
-// Recurses into a schema. The `inPropertiesMap` flag tracks whether the current
-// object is the value of a JSON Schema `properties: {...}` map — in that
-// context, keys are user-defined property NAMES (which may legitimately be
-// literally `"default"`, `"example"`, etc.) and we must NOT strip them.
-//
-// Without this distinction, an OpenAPI schema like
-//   { properties: { default: { oneOf: [...] } } }
-// would have the `default` field silently dropped during generation, producing
-// a TypeScript schema that omits the property. This bit the SAML SSO
-// attribute-mapping codegen (each key has `name?`, `names?`, `array?`, and
-// `default?: any` per OpenAPI spec; the `default?: any` field was silently
-// stripped because of this).
-function sanitizeOpenApiSchema(schema: OpenApiSchema, inPropertiesMap = false): OpenApiSchema {
+// `inPropertiesMap` tracks whether the current object is the value of a
+// `properties: {...}` map; there, keys are user-defined property names (which may
+// legitimately be `"default"`, `"example"`, etc.) and must not be stripped, or a
+// schema like `{ properties: { default: {...} } }` loses that property entirely.
+function isArbitraryJsonDefault(schema: OpenApiSchema): boolean {
+  const members = schema.oneOf ?? schema.anyOf;
+  if (members?.length !== 4) {
+    return false;
+  }
+  const types = new Set(members.map((member) => member.type));
+  return (
+    types.size === 4 &&
+    types.has("object") &&
+    types.has("number") &&
+    types.has("string") &&
+    types.has("boolean")
+  );
+}
+
+export function sanitizeOpenApiSchema(
+  schema: OpenApiSchema,
+  inPropertiesMap = false,
+): OpenApiSchema {
   const sanitized: OpenApiSchema = {};
 
   for (const [key, rawValue] of Object.entries(schema)) {
     if (!inPropertiesMap && SCHEMA_METADATA_KEYS.has(key)) {
+      continue;
+    }
+
+    if (
+      !inPropertiesMap &&
+      key === "propertyNames" &&
+      isRecord(rawValue) &&
+      Object.keys(rawValue).length === 1 &&
+      rawValue.type === "string"
+    ) {
       continue;
     }
 
@@ -250,6 +264,10 @@ function sanitizeOpenApiSchema(schema: OpenApiSchema, inPropertiesMap = false): 
     }
 
     if (isRecord(rawValue)) {
+      if (inPropertiesMap && key === "default" && isArbitraryJsonDefault(rawValue)) {
+        sanitized[key] = {};
+        continue;
+      }
       // The immediate children of `properties: {...}` are property-name keys
       // mapping to schemas; recurse with `inPropertiesMap=true` so the
       // metadata-stripping logic skips that level.
@@ -269,7 +287,36 @@ function sanitizeOpenApiSchema(schema: OpenApiSchema, inPropertiesMap = false): 
     sanitized.pattern = UUID_PATTERN;
   }
 
+  // The spec's `date-time` pattern rejects timestamps the Management API actually
+  // emits (offset-less values, lowercase `t`/`z`); keep `format` but drop the
+  // pattern rather than guessing every shape the API may serialize.
+  if (sanitized.type === "string" && sanitized.format === "date-time") {
+    delete sanitized.pattern;
+  }
+
+  if (
+    sanitized.nullable === true &&
+    sanitized.type === undefined &&
+    Array.isArray(sanitized.anyOf)
+  ) {
+    const normalized = {
+      ...sanitized,
+      anyOf: [...sanitized.anyOf, { type: "null" }],
+    };
+    delete normalized.nullable;
+    return normalized;
+  }
+
   return sanitized;
+}
+
+function convertSchemaToDraft2020(schema: OpenApiSchema) {
+  const sanitized = sanitizeOpenApiSchema(schema);
+  return (
+    sanitized.$schema === JsonSchema.META_SCHEMA_URI_DRAFT_2020_12
+      ? JsonSchema.fromSchemaDraft2020_12(sanitized)
+      : JsonSchema.fromSchemaOpenApi3_0(sanitized)
+  ).schema;
 }
 
 function containsBinarySchema(schema: OpenApiSchema): boolean {
@@ -382,6 +429,19 @@ function resolveSchema(document: OpenApiDocument, schema: OpenApiSchema): OpenAp
   }
 
   return sanitizeOpenApiSchema(schema);
+}
+
+export function normalizeQueryParameterSchema(
+  parameter: OpenApiParameter,
+  schema: OpenApiSchema,
+): OpenApiSchema {
+  const acceptsBoolean =
+    schema.type === "string" &&
+    (typeof parameter.schema?.example === "boolean" ||
+      /\bboolean string\b/iu.test(parameter.description ?? "") ||
+      /\bif (?:true|false)\b/iu.test(parameter.description ?? ""));
+
+  return acceptsBoolean ? { anyOf: [schema, { type: "boolean" }] } : schema;
 }
 
 function getObjectShape(document: OpenApiDocument, schema: OpenApiSchema): ObjectShape | undefined {
@@ -514,7 +574,9 @@ function buildCombinedInputSchema(
     if (parameter.in === "cookie" || parameter.schema === undefined) {
       continue;
     }
-    properties[parameter.name] = resolveSchema(document, parameter.schema);
+    const schema = resolveSchema(document, parameter.schema);
+    properties[parameter.name] =
+      parameter.in === "query" ? normalizeQueryParameterSchema(parameter, schema) : schema;
     if (parameter.required === true) {
       required.add(parameter.name);
     }
@@ -543,7 +605,92 @@ function buildCombinedInputSchema(
   };
 }
 
-function extractOperations(document: OpenApiDocument): ReadonlyArray<OperationDefinition> {
+// The version namespace is derived from the path (not the operationId) so
+// that `/v2/...` routes land in `api.v2` regardless of how their operationId
+// happens to be spelled in the upstream spec.
+export function operationVersionFromPath(path: string): string {
+  const version = path.split("/")[1];
+  if (version === undefined || !/^v\d+$/u.test(version)) {
+    throw new Error(`Expected a version-prefixed path, got ${path}`);
+  }
+  return version;
+}
+
+// Strips a leading version prefix (e.g. `v1`/`V2`) from a camelized operation
+// name and lowercases the next character, so `v2GetProjectConfig` becomes
+// `getProjectConfig`. Names without a prefix are returned unchanged — the path,
+// not the operationId, is the authority on version.
+export function operationMethodName(operationName: string): string {
+  const match = /^([vV]\d+)(.*)$/u.exec(operationName);
+  if (!match) {
+    return operationName;
+  }
+
+  const methodBase = match[2];
+  if (methodBase === undefined || methodBase.length === 0) {
+    return operationName;
+  }
+
+  const first = methodBase.slice(0, 1).toLowerCase();
+  return `${first}${methodBase.slice(1)}`;
+}
+
+// A version prefix on the operationId is optional, but when present must agree
+// with the path-derived version, or the generated namespace and the SDK method
+// name would imply different API versions for the same operation.
+function assertOperationVersionAgreement(operation: {
+  readonly operationId: string;
+  readonly operationName: string;
+  readonly path: string;
+  readonly version: string;
+}): void {
+  const match = /^[vV]\d+/u.exec(operation.operationName);
+  if (!match) {
+    return;
+  }
+
+  const operationNameVersion = match[0].toLowerCase();
+  if (operationNameVersion !== operation.version) {
+    throw new Error(
+      `Operation "${operation.operationId}" at path "${operation.path}" has operationId version "${operationNameVersion}" that disagrees with the path-derived version "${operation.version}"`,
+    );
+  }
+}
+
+function assertUniqueOperations(operations: ReadonlyArray<OperationDefinition>): void {
+  const byNamespaceMethod = new Map<string, OperationDefinition>();
+  const byOperationName = new Map<string, OperationDefinition>();
+  const bySchemaBase = new Map<string, OperationDefinition>();
+
+  for (const operation of operations) {
+    const namespaceMethod = `${operation.version}.${operation.methodName}`;
+    const existingNamespaceMethod = byNamespaceMethod.get(namespaceMethod);
+    if (existingNamespaceMethod) {
+      throw new Error(
+        `Duplicate namespace method "${namespaceMethod}": "${existingNamespaceMethod.operationId}" (${existingNamespaceMethod.method} ${existingNamespaceMethod.path}) collides with "${operation.operationId}" (${operation.method} ${operation.path})`,
+      );
+    }
+    byNamespaceMethod.set(namespaceMethod, operation);
+
+    const existingOperationName = byOperationName.get(operation.operationName);
+    if (existingOperationName) {
+      throw new Error(
+        `Duplicate operation name "${operation.operationName}": "${existingOperationName.operationId}" (${existingOperationName.method} ${existingOperationName.path}) collides with "${operation.operationId}" (${operation.method} ${operation.path})`,
+      );
+    }
+    byOperationName.set(operation.operationName, operation);
+
+    const existingSchemaBase = bySchemaBase.get(operation.schemaBase);
+    if (existingSchemaBase) {
+      throw new Error(
+        `Duplicate schema base "${operation.schemaBase}": "${existingSchemaBase.operationId}" (${existingSchemaBase.method} ${existingSchemaBase.path}) collides with "${operation.operationId}" (${operation.method} ${operation.path})`,
+      );
+    }
+    bySchemaBase.set(operation.schemaBase, operation);
+  }
+}
+
+export function extractOperations(document: OpenApiDocument): ReadonlyArray<OperationDefinition> {
   const operations: Array<OperationDefinition> = [];
 
   for (const [pathName, pathItem] of Object.entries(document.paths)) {
@@ -557,13 +704,25 @@ function extractOperations(document: OpenApiDocument): ReadonlyArray<OperationDe
       const { response, schema: outputSchema } = getResponseDefinition(document, operation);
       const schemaBase = identifier(operation.operationId);
       const description = operation.description?.trim() || operation.summary?.trim() || schemaBase;
+      const operationName = camelize(operation.operationId);
+      const version = operationVersionFromPath(pathName);
+      const methodName = operationMethodName(operationName);
+
+      assertOperationVersionAgreement({
+        operationId: operation.operationId,
+        operationName,
+        path: pathName,
+        version,
+      });
 
       operations.push({
         operationId: operation.operationId,
-        operationName: camelize(operation.operationId),
+        operationName,
         schemaBase,
         method: httpMethods[method],
         path: pathName,
+        version,
+        methodName,
         description,
         pathParams: (operation.parameters ?? [])
           .filter((parameter) => parameter.in === "path")
@@ -584,7 +743,11 @@ function extractOperations(document: OpenApiDocument): ReadonlyArray<OperationDe
     }
   }
 
-  return operations.sort((left, right) => left.operationId.localeCompare(right.operationId));
+  const sortedOperations = operations.sort((left, right) =>
+    left.operationId.localeCompare(right.operationId),
+  );
+  assertUniqueOperations(sortedOperations);
+  return sortedOperations;
 }
 
 function renderSchemaSource(
@@ -612,31 +775,35 @@ function renderSchemaSource(
   const definitions = Object.fromEntries(
     Object.entries(document.components?.schemas ?? {}).map(([name, schema]) => [
       name,
-      normalizeNullableJsonSchema(
-        JsonSchema.fromSchemaOpenApi3_0(sanitizeOpenApiSchema(schema)).schema,
-      ),
+      normalizeNullableJsonSchema(convertSchemaToDraft2020(schema)),
     ]),
   );
 
   const nameMap = schemaEntries.map((entry) => entry.name);
   const schemas = schemaEntries.map((entry) =>
-    normalizeNullableJsonSchema(JsonSchema.fromSchemaOpenApi3_0(entry.schema).schema),
+    normalizeNullableJsonSchema(convertSchemaToDraft2020(entry.schema)),
   );
 
   if (!Arr.isArrayNonEmpty(schemas)) {
     return "";
   }
 
-  const multiDocument = SchemaRepresentation.fromJsonSchemaMultiDocument(
+  const importedSchemas = SchemaRepresentation.fromJsonSchemaMultiDocument(
     {
       dialect: "draft-2020-12",
       definitions,
       schemas,
     },
     {
+      patterns: "apply",
       onEnter(schema) {
         const next = { ...schema };
-        if (next.type === "object" && next.additionalProperties === undefined) {
+        // Bare object schemas stay open; declared-property shapes are closed.
+        if (
+          next.type === "object" &&
+          next.properties !== undefined &&
+          next.additionalProperties === undefined
+        ) {
           next.additionalProperties = false;
         }
         return next;
@@ -644,7 +811,9 @@ function renderSchemaSource(
     },
   );
 
-  const codeDocument = SchemaRepresentation.toCodeDocument(multiDocument);
+  const codeDocument = SchemaRepresentation.toCodeDocument(
+    SchemaRepresentation.toRepresentations(Arr.map(importedSchemas, (schema) => schema.ast)),
+  );
   const hasBinaryInputs = operations.some((operation) =>
     containsBinarySchema(operation.inputSchema),
   );
@@ -666,7 +835,7 @@ function renderSchemaSource(
     parts.push("// recursive definitions");
     for (const [name, code] of recursiveEntries) {
       parts.push(
-        `export const ${name} = ${hasBinaryInputs ? replaceBinarySchemaCode(code.runtime) : code.runtime}`,
+        `export type ${name} = ${code.Type}\nexport const ${name} = ${hasBinaryInputs ? replaceBinarySchemaCode(code.runtime) : code.runtime}`,
       );
     }
   }
@@ -711,7 +880,7 @@ function renderResponse(definition: ResponseDefinition): string {
   return `{ kind: ${JSON.stringify(definition.kind)} }`;
 }
 
-function renderContracts(
+export function renderContracts(
   document: OpenApiDocument,
   operations: ReadonlyArray<OperationDefinition>,
 ): string {
@@ -771,34 +940,12 @@ export type VoidOperationDefinition<Id extends OperationId = OperationId> = Extr
 `;
 }
 
-function splitOperationVersion(operationName: string): {
-  readonly version: string;
-  readonly methodName: string;
-} {
-  const match = /^((?:v|V)\d+)(.+)$/u.exec(operationName);
-  if (!match) {
-    throw new Error(`Expected a version-prefixed operation id, got ${operationName}`);
-  }
-
-  const [, version, methodBase] = match;
-  if (version === undefined || methodBase === undefined || methodBase.length === 0) {
-    throw new Error(`Expected an operation method segment after the version in ${operationName}`);
-  }
-  const first = methodBase.slice(0, 1).toLowerCase();
-
-  return {
-    version,
-    methodName: `${first}${methodBase.slice(1)}`,
-  };
-}
-
-function renderEffectClient(operations: ReadonlyArray<OperationDefinition>): string {
+export function renderEffectClient(operations: ReadonlyArray<OperationDefinition>): string {
   const versionedOperations = new Map<string, Array<OperationDefinition>>();
   for (const operation of operations) {
-    const { version } = splitOperationVersion(operation.operationName);
-    const group = versionedOperations.get(version);
+    const group = versionedOperations.get(operation.version);
     if (group === undefined) {
-      versionedOperations.set(version, [operation]);
+      versionedOperations.set(operation.version, [operation]);
     } else {
       group.push(operation);
     }
@@ -809,7 +956,7 @@ function renderEffectClient(operations: ReadonlyArray<OperationDefinition>): str
     .map(([version, groupedOperations]) => {
       const methods = groupedOperations
         .map((operation) => {
-          const { methodName } = splitOperationVersion(operation.operationName);
+          const { methodName } = operation;
           const isEmptyInput =
             operation.inputSchema.type === "object" &&
             Object.keys(operation.inputSchema.properties ?? {}).length === 0;
@@ -839,7 +986,7 @@ ${methods}
 
   const executorCases = operations
     .map((operation) => {
-      const { version, methodName } = splitOperationVersion(operation.operationName);
+      const { version, methodName } = operation;
       const isEmptyInput =
         operation.inputSchema.type === "object" &&
         Object.keys(operation.inputSchema.properties ?? {}).length === 0;

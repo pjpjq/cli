@@ -26,11 +26,11 @@ func TestUpdateApi(t *testing.T) {
 		gock.New(server).
 			Get("/v1/projects/test-project/postgrest").
 			Reply(http.StatusOK).
-			JSON(v1API.PostgrestConfigWithJWTSecretResponse{})
+			JSON(v1API.PostgrestConfigWithJWTSecretResponseOutput{})
 		gock.New(server).
 			Patch("/v1/projects/test-project/postgrest").
 			Reply(http.StatusOK).
-			JSON(v1API.PostgrestConfigWithJWTSecretResponse{
+			JSON(v1API.PostgrestConfigWithJWTSecretResponseOutput{
 				DbSchema:          "public,graphql_public",
 				DbExtraSearchPath: "public,extensions",
 				MaxRows:           1000,
@@ -54,7 +54,7 @@ func TestUpdateApi(t *testing.T) {
 		gock.New(server).
 			Get("/v1/projects/test-project/postgrest").
 			Reply(http.StatusOK).
-			JSON(v1API.PostgrestConfigWithJWTSecretResponse{
+			JSON(v1API.PostgrestConfigWithJWTSecretResponseOutput{
 				DbSchema:          "",
 				DbExtraSearchPath: "public,extensions",
 				MaxRows:           1000,
@@ -79,11 +79,11 @@ func TestUpdateDbConfig(t *testing.T) {
 		gock.New(server).
 			Get("/v1/projects/test-project/config/database").
 			Reply(http.StatusOK).
-			JSON(v1API.PostgresConfigResponse{})
+			JSON(v1API.PostgresConfigResponseOutput{})
 		gock.New(server).
 			Put("/v1/projects/test-project/config/database").
 			Reply(http.StatusOK).
-			JSON(v1API.PostgresConfigResponse{
+			JSON(v1API.PostgresConfigResponseOutput{
 				MaxConnections: cast.Ptr(cast.UintToInt(100)),
 			})
 		// Run test
@@ -104,7 +104,7 @@ func TestUpdateDbConfig(t *testing.T) {
 		gock.New(server).
 			Get("/v1/projects/test-project/config/database").
 			Reply(http.StatusOK).
-			JSON(v1API.PostgresConfigResponse{
+			JSON(v1API.PostgresConfigResponseOutput{
 				MaxConnections: cast.Ptr(cast.UintToInt(100)),
 			})
 		// Run test
@@ -204,8 +204,9 @@ func TestUpdateAuthConfig(t *testing.T) {
 		gock.New(server).
 			Get("/v1/projects/test-project/config/auth").
 			Reply(http.StatusOK).
-			JSON(v1API.AuthConfigResponse{
-				SiteUrl: nullable.NewNullableWithValue("http://localhost:3000"),
+			JSON(v1API.AuthConfigResponseOutput{
+				SiteUrl:        nullable.NewNullableWithValue("http://localhost:3000"),
+				SmtpAdminEmail: nullable.NewNullableWithValue(openapi_types.Email("abc@example.com")),
 			})
 		gock.New(server).
 			Patch("/v1/projects/test-project/config/auth").
@@ -224,7 +225,9 @@ func TestUpdateAuthConfig(t *testing.T) {
 		gock.New(server).
 			Get("/v1/projects/test-project/config/auth").
 			Reply(http.StatusOK).
-			JSON(v1API.AuthConfigResponse{})
+			JSON(v1API.AuthConfigResponseOutput{
+				SmtpAdminEmail: nullable.NewNullableWithValue(openapi_types.Email("abc@example.com")),
+			})
 		// Run test
 		err := updater.UpdateAuthConfig(context.Background(), "test-project", auth{
 			Enabled:                true,
@@ -256,7 +259,7 @@ func TestUpdateStorageConfig(t *testing.T) {
 		updater := NewConfigUpdater(*client)
 		// Setup mock server
 		defer gock.Off()
-		mockStorage := v1API.StorageConfigResponse{
+		mockStorage := v1API.StorageConfigResponseOutput{
 			FileSizeLimit: 100,
 		}
 		mockStorage.Features.ImageTransformation.Enabled = true
@@ -282,7 +285,7 @@ func TestUpdateStorageConfig(t *testing.T) {
 		gock.New(server).
 			Get("/v1/projects/test-project/config/storage").
 			Reply(http.StatusOK).
-			JSON(v1API.StorageConfigResponse{})
+			JSON(v1API.StorageConfigResponseOutput{})
 		// Run test
 		err := updater.UpdateStorageConfig(context.Background(), "test-project", storage{Enabled: true})
 		// Check result
@@ -312,11 +315,11 @@ func TestUpdateRemoteConfig(t *testing.T) {
 		gock.New(server).
 			Get("/v1/projects/test-project/postgrest").
 			Reply(http.StatusOK).
-			JSON(v1API.PostgrestConfigWithJWTSecretResponse{})
+			JSON(v1API.PostgrestConfigWithJWTSecretResponseOutput{})
 		gock.New(server).
 			Patch("/v1/projects/test-project/postgrest").
 			Reply(http.StatusOK).
-			JSON(v1API.PostgrestConfigWithJWTSecretResponse{
+			JSON(v1API.PostgrestConfigWithJWTSecretResponseOutput{
 				DbSchema: "public",
 				MaxRows:  1000,
 			})
@@ -324,23 +327,18 @@ func TestUpdateRemoteConfig(t *testing.T) {
 		gock.New(server).
 			Get("/v1/projects/test-project/config/database").
 			Reply(http.StatusOK).
-			JSON(v1API.PostgresConfigResponse{})
+			JSON(v1API.PostgresConfigResponseOutput{})
 		gock.New(server).
 			Put("/v1/projects/test-project/config/database").
 			Reply(http.StatusOK).
-			JSON(v1API.PostgresConfigResponse{
+			JSON(v1API.PostgresConfigResponseOutput{
 				MaxConnections: cast.Ptr(cast.UintToInt(100)),
 			})
-		// Network config
-		gock.New(server).
-			Get("/v1/projects/test-project/network-restrictions").
-			Reply(http.StatusOK).
-			JSON(v1API.V1GetNetworkRestrictionsResponse{})
 		// Auth config
 		gock.New(server).
 			Get("/v1/projects/test-project/config/auth").
 			Reply(http.StatusOK).
-			JSON(v1API.AuthConfigResponse{
+			JSON(v1API.AuthConfigResponseOutput{
 				SmtpAdminEmail: nullable.NewNullableWithValue(openapi_types.Email("abc@example.com")),
 			})
 		gock.New(server).
@@ -350,7 +348,7 @@ func TestUpdateRemoteConfig(t *testing.T) {
 		gock.New(server).
 			Get("/v1/projects/test-project/config/storage").
 			Reply(http.StatusOK).
-			JSON(v1API.StorageConfigResponse{})
+			JSON(v1API.StorageConfigResponseOutput{})
 		gock.New(server).
 			Patch("/v1/projects/test-project/config/storage").
 			Reply(http.StatusOK)

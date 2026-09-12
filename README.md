@@ -124,22 +124,23 @@ This repository is a pnpm monorepo. The published package lives in `apps/cli`.
 
 ```sh
 pnpm install
+pnpm check:all
+
 cd apps/cli
 
-pnpm dev:next -- --help
-pnpm check:all
-pnpm test:core
+pnpm types:check
+pnpm run test:unit && pnpm run test:integration
 ```
 
 Useful source entry points:
 
-| Path              | Purpose                                |
-| ----------------- | -------------------------------------- |
-| `apps/cli`        | TypeScript/Bun CLI package             |
-| `apps/cli-go`     | Go CLI source used by the legacy shell |
-| `packages/stack`  | Local Supabase stack runtime           |
-| `packages/config` | Config schema and generated types      |
-| `packages/api`    | Typed Supabase Management API client   |
+| Path              | Purpose                              |
+| ----------------- | ------------------------------------ |
+| `apps/cli`        | TypeScript/Bun CLI package           |
+| `apps/cli-go`     | Go CLI source used by the CLI        |
+| `packages/stack`  | Local Supabase stack runtime         |
+| `packages/config` | Config schema and generated types    |
+| `packages/api`    | Typed Supabase Management API client |
 
 After a fresh clone, install the reference repositories used for agent and developer inspection:
 
@@ -149,11 +150,26 @@ pnpm repos:install
 
 ## Contributing
 
-We love focused pull requests with a clear problem, a small surface area, and tests that match the user-facing behavior. Before opening a PR, run the checks for the workspace you touched.
+We love focused pull requests with a clear problem, a small surface area, and tests that match the user-facing behavior.
+
+Open an issue first and wait for a maintainer to add the `open-for-contribution` label before starting work — external pull requests that don't link a labeled, open issue are closed automatically. See [CONTRIBUTING.md](./CONTRIBUTING.md#contribution-workflow) for the full workflow.
+
+Before opening a PR, run repo-wide quality checks from the repository root,
+then run the relevant package tests from each workspace you touched. For each
+touched TypeScript workspace (or any workspace that declares it), also run its
+`pnpm types:check` script. For example:
 
 ```sh
+# From the repository root:
 pnpm check:all
-pnpm test
+
+# From apps/cli (a touched TypeScript workspace):
+cd apps/cli
+pnpm types:check
+pnpm run test:unit && pnpm run test:integration
+
+# Repeat the relevant package tests for every touched workspace; run
+# pnpm types:check there too when that workspace declares the script.
 ```
 
 PR titles must use conventional commits, for example:

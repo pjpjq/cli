@@ -1,42 +1,30 @@
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import process from "node:process";
 import { BunServices } from "@effect/platform-bun";
-import { Deferred, Effect, Layer, Option, PubSub, Redacted, Stream } from "effect";
-import type { ReactElement } from "react";
-import type { ProjectEnvironment, ProjectPaths } from "@supabase/config";
+import { Deferred, Effect, Layer, Option, Redacted, Stream } from "effect";
+import type { CliProjectEnvironment, CliProjectPaths } from "@supabase/config";
+import { Api } from "../../src/shared/auth/api.service.ts";
+import type { LoginSessionResponse, ProfileResponse } from "../../src/shared/auth/api.service.ts";
+import { Credentials } from "../../src/shared/auth/credentials.service.ts";
+import { Crypto } from "../../src/shared/auth/crypto.service.ts";
+import { ApiError } from "../../src/shared/auth/errors.ts";
+import { cliSettingsLayer } from "../../src/shared/config/cli-settings.layer.ts";
+import { CliProjectHome } from "../../src/shared/config/cli-project-home.service.ts";
 import {
-  NoRunningStackError,
-  StateNotFoundError,
-  Stack,
-  StackServiceState,
-  StateManager,
-  StackMetadataNotFoundError,
-  type StackInfo,
-  type StackMetadata,
-  type StackState,
-} from "@supabase/stack/effect";
-import { UnixHttpClient } from "@supabase/stack";
-import { Api } from "../../src/next/auth/api.service.ts";
-import type { LoginSessionResponse, ProfileResponse } from "../../src/next/auth/api.service.ts";
-import { Credentials } from "../../src/next/auth/credentials.service.ts";
-import { Crypto } from "../../src/next/auth/crypto.service.ts";
-import { ApiError } from "../../src/next/auth/errors.ts";
-import { cliConfigLayer } from "../../src/next/config/cli-config.layer.ts";
-import { ProjectHome } from "../../src/next/config/project-home.service.ts";
-import {
-  ProjectLocalServiceVersions,
+  CliProjectLocalServiceVersions,
   type LocalServiceVersionsState,
-} from "../../src/next/config/project-local-service-versions.service.ts";
-import { ProjectLinkRemote } from "../../src/next/config/project-link-remote.service.ts";
+} from "../../src/shared/config/cli-project-local-service-versions.service.ts";
+import { ProjectLinkRemote } from "../../src/shared/config/project-link-remote.service.ts";
 import {
   ProjectLinkState,
   type ProjectLinkStateValue,
-} from "../../src/next/config/project-link-state.service.ts";
-import { ProjectContext } from "../../src/next/config/project-context.service.ts";
+} from "../../src/shared/config/project-link-state.service.ts";
+import { CliProjectContext } from "../../src/shared/config/cli-project-context.service.ts";
 import { NonInteractiveError } from "../../src/shared/output/errors.ts";
 import { Output } from "../../src/shared/output/output.service.ts";
 import type { OutputFormat } from "../../src/shared/output/types.ts";
 import { Browser } from "../../src/shared/runtime/browser.service.ts";
-import { Ink, type InkInstance } from "../../src/shared/runtime/ink.service.ts";
 import {
   ProcessControl,
   type CliProcessSignal,
@@ -45,12 +33,9 @@ import { RuntimeInfo } from "../../src/shared/runtime/runtime-info.service.ts";
 import { Stdin } from "../../src/shared/runtime/stdin.service.ts";
 import { Tty } from "../../src/shared/runtime/tty.service.ts";
 import { Analytics } from "../../src/shared/telemetry/analytics.service.ts";
+import { CurrentAnalyticsContext } from "../../src/shared/telemetry/analytics-context.ts";
 import { TelemetryRuntime } from "../../src/shared/telemetry/runtime.service.ts";
 import { makeTelemetryIdentity } from "../../src/shared/telemetry/identity.ts";
-
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
 
 type OutputMessage = {
   type: "intro" | "outro" | "info" | "warn" | "error" | "success" | "fail";
@@ -70,9 +55,14 @@ type OutputEvent = {
   [key: string]: unknown;
 };
 
-// ---------------------------------------------------------------------------
-// Stateless mocks
-// ---------------------------------------------------------------------------
+// Default home for mocks that need *some* path value; unique per process and never
+// created on disk, so a test combining it with a real FileSystem layer can't collide
+// with another run's files. Tests that read/write real files under homeDir should use
+// `useTempWorkdir` in `command-mocks.ts` instead.
+const defaultTestHomeDir = join(
+  tmpdir(),
+  `supabase-cli-test-home-${process.pid.toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+);
 
 export function mockBrowser(): Layer.Layer<Browser> {
   return Layer.succeed(Browser, {
@@ -100,14 +90,33 @@ export function mockStdin(isTTY: boolean, pipedInput?: string | Uint8Array): Lay
           typeof pipedInput === "string" ? new TextEncoder().encode(pipedInput) : pipedInput,
         );
 
+  const pipedText = Option.isSome(pipedBytes)
+    ? Option.some(new TextDecoder().decode(pipedBytes.value))
+    : Option.none<string>();
+
+  // Drops the trailing empty element a final newline leaves behind, matching
+  // production `Stream.splitLines`; interior blank lines are preserved.
+  const lines = Option.isSome(pipedText) ? pipedText.value.split(/\r?\n/u) : [];
+  if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+  let lineIndex = 0;
+
   return Layer.succeed(Stdin, {
     isTTY,
     readPipedBytes: Effect.succeed(pipedBytes),
-    readPipedText: Effect.succeed(
-      Option.isSome(pipedBytes)
-        ? Option.some(new TextDecoder().decode(pipedBytes.value))
-        : Option.none<string>(),
-    ),
+    pipedBytesStream: Option.isSome(pipedBytes)
+      ? Stream.fromIterable([pipedBytes.value])
+      : Stream.empty,
+    readPipedText: Effect.succeed(pipedText),
+    // Ignores any timeout argument; dispenses piped lines one per call (trimmed),
+    // then None once exhausted.
+    readLine: () =>
+      Effect.sync(() => {
+        if (lineIndex >= lines.length) {
+          return Option.none<string>();
+        }
+        const line = (lines[lineIndex++] ?? "").trim();
+        return line.length > 0 ? Option.some(line) : Option.none<string>();
+      }),
   });
 }
 
@@ -115,11 +124,13 @@ export function mockTty(
   opts: {
     stdinIsTty?: boolean;
     stdoutIsTty?: boolean;
+    stdoutIsPipe?: boolean;
   } = {},
 ): Layer.Layer<Tty> {
   return Layer.succeed(Tty, {
     stdinIsTty: opts.stdinIsTty ?? false,
     stdoutIsTty: opts.stdoutIsTty ?? false,
+    stdoutIsPipe: opts.stdoutIsPipe ?? false,
   });
 }
 
@@ -137,7 +148,7 @@ export function mockRuntimeInfo(
     cwd: opts.cwd ?? "/test/project",
     platform: opts.platform ?? "linux",
     arch: opts.arch ?? "x64",
-    homeDir: opts.homeDir ?? "/tmp/supabase-cli-test-home",
+    homeDir: opts.homeDir ?? defaultTestHomeDir,
     execPath: opts.execPath ?? "/test/bin/bun",
     pid: opts.pid ?? 1234,
   });
@@ -189,10 +200,6 @@ export function mockProcessControl(
   };
 }
 
-// ---------------------------------------------------------------------------
-// Stateful mock factories
-// ---------------------------------------------------------------------------
-
 export function mockCredentials(opts: { existingToken?: string } = {}) {
   let savedToken: string | undefined;
   let deleteWasCalled = false;
@@ -235,6 +242,7 @@ export function mockOutput(
   } = {},
 ) {
   const messages: OutputMessage[] = [];
+  const failures: Array<Parameters<ReturnType<typeof Output.of>["fail"]>[0]> = [];
   const progressEvents: ProgressEvent[] = [];
   const events: OutputEvent[] = [];
   const rawChunks: Array<{ text: string; stream: "stdout" | "stderr" }> = [];
@@ -257,6 +265,10 @@ export function mockOutput(
           maxItems?: number;
         }
       | undefined;
+  }> = [];
+  const promptTextCalls: Array<{
+    message: string;
+    opts?: { defaultValue?: string; validate?: (v: string) => string | undefined };
   }> = [];
   const promptTextResponses = [...(opts.promptTextResponses ?? [])];
   const promptSelectResponses = [...(opts.promptSelectResponses ?? [])];
@@ -332,6 +344,18 @@ export function mockOutput(
                 : JSON.stringify(event),
           });
         }),
+      result: (data: unknown) =>
+        Effect.sync(() => {
+          if (opts.format === "json") {
+            rawChunks.push({ text: `${JSON.stringify(data)}\n`, stream: "stdout" });
+          } else if (opts.format === "stream-json") {
+            events.push({
+              type: "result",
+              data,
+              timestamp: new Date().toISOString(),
+            });
+          }
+        }),
       success: (message: string, data?: Record<string, unknown>) =>
         Effect.sync(() => {
           messages.push({ type: "success", message, data });
@@ -339,6 +363,7 @@ export function mockOutput(
       fail: (err: { code: string; message: string; detail?: string; suggestion?: string }) =>
         Effect.sync(() => {
           messages.push({ type: "fail", message: err.message });
+          failures.push(err);
         }),
       progress: (opts: { max: number }) =>
         Effect.sync(() => ({
@@ -362,16 +387,17 @@ export function mockOutput(
       promptText: (() => {
         let callCount = 0;
         return (
-          _msg: string,
+          message: string,
           options?: { defaultValue?: string; validate?: (v: string) => string | undefined },
         ) => {
           callCount++;
-          // Exercise the validate callback to cover both branches (line 140)
+          promptTextCalls.push({ message, opts: options });
+          // Runs the validate callback so both branches get coverage.
           if (options?.validate) {
-            options.validate(""); // truthy branch: returns error message
-            options.validate("123456"); // falsy branch: returns undefined
+            options.validate(""); // returns an error message
+            options.validate("123456"); // returns undefined
           }
-          // Fail on the verification prompt (2nd call), not the "Press Enter" prompt (1st call)
+          // Fails the verification prompt (2nd call), not the "Press Enter" prompt (1st call).
           if (opts.promptTextFail && callCount > 1) {
             return Effect.fail(
               new NonInteractiveError({
@@ -422,10 +448,12 @@ export function mockOutput(
         }),
     }),
     messages,
+    failures,
     progressEvents,
     events,
     promptConfirmCalls,
     promptSelectCalls,
+    promptTextCalls,
     rawChunks,
     get stdoutText() {
       return rawChunks
@@ -490,6 +518,48 @@ export function mockApi(
       return profileCallCount;
     },
   };
+}
+
+/**
+ * Like `mockAnalytics()`, but merges `CurrentAnalyticsContext` into captured event
+ * properties. Use it when asserting on context-carried fields (`flags`, `groups`).
+ */
+export function mockContextualAnalytics(): ReturnType<typeof mockAnalytics> {
+  const captured: Array<{ event: string; properties: Record<string, unknown> }> = [];
+  const identified: Array<{ distinctId: string; properties: Record<string, unknown> }> = [];
+  const aliased: Array<{ distinctId: string; alias: string }> = [];
+  const groupIdentified: Array<{
+    groupType: string;
+    groupKey: string;
+    properties: Record<string, unknown>;
+  }> = [];
+  const layer = Layer.succeed(
+    Analytics,
+    Analytics.of({
+      capture: (event: string, properties: Record<string, unknown> = {}) =>
+        Effect.gen(function* () {
+          const context = yield* CurrentAnalyticsContext;
+          captured.push({ event, properties: { ...context, ...properties } });
+        }),
+      identify: (distinctId: string, properties: Record<string, unknown> = {}) =>
+        Effect.sync(() => {
+          identified.push({ distinctId, properties });
+        }),
+      alias: (distinctId: string, alias: string) =>
+        Effect.sync(() => {
+          aliased.push({ distinctId, alias });
+        }),
+      groupIdentify: (
+        groupType: string,
+        groupKey: string,
+        properties: Record<string, unknown> = {},
+      ) =>
+        Effect.sync(() => {
+          groupIdentified.push({ groupType, groupKey, properties });
+        }),
+    }),
+  );
+  return { layer, captured, identified, aliased, groupIdentified };
 }
 
 export function mockAnalytics() {
@@ -564,8 +634,8 @@ export function mockTelemetryRuntime(
   return Layer.succeed(
     TelemetryRuntime,
     TelemetryRuntime.of({
-      configDir: opts.configDir ?? "/tmp/supabase-cli-test-home/.supabase",
-      tracesDir: opts.tracesDir ?? "/tmp/supabase-cli-test-home/.supabase/traces",
+      configDir: opts.configDir ?? join(defaultTestHomeDir, ".supabase"),
+      tracesDir: opts.tracesDir ?? join(defaultTestHomeDir, ".supabase", "traces"),
       consent: opts.consent ?? "granted",
       showDebug: opts.showDebug ?? false,
       deviceId: opts.deviceId ?? "test-device-id",
@@ -580,216 +650,6 @@ export function mockTelemetryRuntime(
     }),
   );
 }
-
-export function mockStack(
-  opts: {
-    info?: Partial<StackInfo>;
-    stateChanges?: Array<{ name: string; status: StackServiceState["status"] }>;
-    startError?: unknown;
-    startPending?: boolean;
-    stopPending?: boolean;
-    liveStateChanges?: boolean;
-  } = {},
-) {
-  let started = false;
-  let stopped = false;
-  const startDeferred = Deferred.makeUnsafe<void>();
-  const stopDeferred = Deferred.makeUnsafe<void>();
-  const stateHistory = [...(opts.stateChanges ?? [])];
-  const statePubSub = Effect.runSync(
-    PubSub.unbounded<StackServiceState>({
-      replay: Math.max(stateHistory.length, 1) + 8,
-    }),
-  );
-  for (const change of stateHistory) {
-    PubSub.publishUnsafe(
-      statePubSub,
-      new StackServiceState({
-        name: change.name,
-        status: change.status,
-        pid: null,
-        exitCode: null,
-        restartCount: 0,
-        startedAt: null,
-        error: null,
-      }),
-    );
-  }
-  const info: StackInfo = {
-    url: "http://127.0.0.1:54321",
-    dbUrl: "postgresql://postgres:postgres@127.0.0.1:54322/postgres",
-    publishableKey: "test-publishable-key",
-    secretKey: "test-secret-key",
-    anonJwt: "test-anon-jwt",
-    serviceRoleJwt: "test-service-role-jwt",
-    serviceEndpoints: {},
-    ...opts.info,
-  };
-
-  return {
-    layer: Layer.succeed(Stack, {
-      getInfo: () => Effect.succeed(info),
-      start: () =>
-        Effect.gen(function* () {
-          started = true;
-          if (opts.startError !== undefined) {
-            return yield* Effect.fail(opts.startError as never);
-          }
-          if (opts.startPending) {
-            yield* Deferred.await(startDeferred);
-          }
-        }),
-      stop: () =>
-        Effect.gen(function* () {
-          stopped = true;
-          if (opts.stopPending) {
-            yield* Deferred.await(stopDeferred);
-          }
-        }),
-      dispose: () =>
-        Effect.gen(function* () {
-          stopped = true;
-          if (opts.stopPending) {
-            yield* Deferred.await(stopDeferred);
-          }
-        }),
-      startService: () => Effect.void,
-      stopService: () => Effect.void,
-      restartService: () => Effect.void,
-      reloadFunctions: () => Effect.void,
-      reloadEdgeRuntime: () => Effect.void,
-      getState: () =>
-        Effect.succeed(
-          new StackServiceState({
-            name: "postgres",
-            status: "Healthy",
-            pid: null,
-            exitCode: null,
-            restartCount: 0,
-            startedAt: null,
-            error: null,
-          }),
-        ),
-      getAllStates: () => {
-        const serviceNames = opts.stateChanges
-          ? [...new Set(opts.stateChanges.map((s) => s.name))]
-          : ["postgres"];
-        return Effect.succeed(
-          serviceNames.map(
-            (name) =>
-              new StackServiceState({
-                name,
-                status: "Pending",
-                pid: null,
-                exitCode: null,
-                restartCount: 0,
-                startedAt: null,
-                error: null,
-              }),
-          ),
-        );
-      },
-      stateChanges: () => Effect.succeed(Stream.empty),
-      allStateChanges: () =>
-        opts.liveStateChanges
-          ? Stream.fromPubSub(statePubSub)
-          : opts.stateChanges
-            ? Stream.fromIterable(
-                opts.stateChanges.map(
-                  (change) =>
-                    new StackServiceState({
-                      name: change.name,
-                      status: change.status,
-                      pid: null,
-                      exitCode: null,
-                      restartCount: 0,
-                      startedAt: null,
-                      error: null,
-                    }),
-                ),
-              )
-            : Stream.empty,
-      waitReady: () => Effect.void,
-      waitAllReady: () => Effect.void,
-      subscribeLogs: () => Stream.empty,
-      subscribeAllLogs: () => Stream.empty,
-      logHistory: () => Effect.succeed([]),
-      logHistoryAll: () => Effect.succeed([]),
-    }),
-    get started() {
-      return started;
-    },
-    get stopped() {
-      return stopped;
-    },
-    emitStateChange(change: { name: string; status: StackServiceState["status"] }) {
-      stateHistory.push(change);
-      PubSub.publishUnsafe(
-        statePubSub,
-        new StackServiceState({
-          name: change.name,
-          status: change.status,
-          pid: null,
-          exitCode: null,
-          restartCount: 0,
-          startedAt: null,
-          error: null,
-        }),
-      );
-    },
-    resolveStart() {
-      Effect.runSync(Deferred.succeed(startDeferred, void 0));
-    },
-    resolveStop() {
-      Effect.runSync(Deferred.succeed(stopDeferred, void 0));
-    },
-    info,
-  };
-}
-
-export function mockInk(opts: { manualExit?: boolean } = {}) {
-  let rendered = false;
-  let unmounted = false;
-  let element: ReactElement | null = null;
-  let resolveExit = () => {};
-  const exitPromise = new Promise<unknown>((resolve) => {
-    resolveExit = () => resolve(undefined);
-  });
-  return {
-    layer: Layer.succeed(Ink, {
-      render: (nextElement) =>
-        Effect.sync(() => {
-          rendered = true;
-          element = nextElement;
-          return {
-            unmount: () => {
-              unmounted = true;
-            },
-            rerender: (updatedElement) => {
-              element = updatedElement;
-            },
-            waitUntilExit: () => (opts.manualExit ? exitPromise : Promise.resolve()),
-          } satisfies InkInstance;
-        }),
-    }),
-    get rendered() {
-      return rendered;
-    },
-    get unmounted() {
-      return unmounted;
-    },
-    get element() {
-      return element;
-    },
-    exit() {
-      resolveExit();
-    },
-  };
-}
-
-// ---------------------------------------------------------------------------
-// Environment helpers
-// ---------------------------------------------------------------------------
 
 function applyProcessEnv(values: Readonly<Record<string, string | undefined>>) {
   const snapshot = { ...process.env };
@@ -821,119 +681,43 @@ export function processEnvLayer(
   );
 }
 
-export function mockProjectContext(
+export function mockCliProjectContext(
   opts: {
-    paths?: Option.Option<ProjectPaths>;
-    projectEnv?: Option.Option<ProjectEnvironment>;
+    paths?: Option.Option<CliProjectPaths>;
+    projectEnv?: Option.Option<CliProjectEnvironment>;
   } = {},
-): Layer.Layer<ProjectContext> {
+): Layer.Layer<CliProjectContext> {
   return Layer.succeed(
-    ProjectContext,
-    ProjectContext.of({
+    CliProjectContext,
+    CliProjectContext.of({
       paths: opts.paths ?? Option.none(),
       projectEnv: opts.projectEnv ?? Option.none(),
     }),
   );
 }
 
-function mockProjectHome(
+function mockCliProjectHome(
   opts: {
     projectRoot?: string;
     supabaseDir?: string;
     projectHomeDir?: string;
   } = {},
-): Layer.Layer<ProjectHome> {
+): Layer.Layer<CliProjectHome> {
   const projectRoot = opts.projectRoot ?? "/test/project";
   const supabaseDir = opts.supabaseDir ?? `${projectRoot}/supabase`;
   const projectHomeDir = opts.projectHomeDir ?? `${projectRoot}/.supabase`;
 
   return Layer.succeed(
-    ProjectHome,
-    ProjectHome.of({
+    CliProjectHome,
+    CliProjectHome.of({
       projectRoot,
       supabaseDir,
       projectHomeDir,
       projectLinkPath: `${projectHomeDir}/project.json`,
       projectLocalVersionsPath: `${projectHomeDir}/local-versions.json`,
-      ensureProjectHomeDir: Effect.void,
-      stackDir: (name: string) => `${projectHomeDir}/stacks/${name}`,
-      stackStatePath: (name: string) => `${projectHomeDir}/stacks/${name}/state.json`,
-      stackMetadataPath: (name: string) => `${projectHomeDir}/stacks/${name}/stack.json`,
-      stackDataDir: (name: string) => `${projectHomeDir}/stacks/${name}/data`,
-      stackLogsDir: (name: string) => `${projectHomeDir}/stacks/${name}/logs`,
+      ensureCliProjectHomeDir: Effect.void,
     }),
   );
-}
-
-export function mockStateManager(
-  opts: {
-    states?: ReadonlyArray<StackState>;
-    metadata?: ReadonlyArray<{ name: string; metadata: StackMetadata }>;
-  } = {},
-): Layer.Layer<StateManager> {
-  const states = new Map((opts.states ?? []).map((state) => [state.name, state] as const));
-  const metadata = new Map((opts.metadata ?? []).map((entry) => [entry.name, entry.metadata]));
-
-  return Layer.succeed(StateManager, {
-    stackDir: (name: string) => `/test/project/.supabase/stacks/${name}`,
-    dataDir: (name: string) => `/test/project/.supabase/stacks/${name}/data`,
-    runtimeDir: (name: string) => `/tmp/supabase/${name}`,
-    socketPath: (name: string) => `/tmp/supabase/${name}/daemon.sock`,
-    metadataFile: (name: string) => `/test/project/.supabase/stacks/${name}/stack.json`,
-    stackExists: (name: string) => Effect.succeed(states.has(name) || metadata.has(name)),
-    write: (state: StackState) =>
-      Effect.sync(() => {
-        states.set(state.name, state);
-      }),
-    read: (name: string) =>
-      Effect.gen(function* () {
-        const state = states.get(name);
-        if (state === undefined) {
-          return yield* Effect.fail(new StateNotFoundError({ name }));
-        }
-        return state;
-      }),
-    scan: () => Effect.sync(() => Array.from(states.values())),
-    writeMetadata: (name: string, value: StackMetadata) =>
-      Effect.sync(() => {
-        metadata.set(name, value);
-      }),
-    updateMetadata: (name: string, update: (value: StackMetadata) => StackMetadata) =>
-      Effect.gen(function* () {
-        const value = metadata.get(name);
-        if (value === undefined) {
-          return yield* Effect.fail(new StackMetadataNotFoundError({ name }));
-        }
-        metadata.set(name, update(value));
-      }),
-    readMetadata: (name: string) =>
-      Effect.gen(function* () {
-        const value = metadata.get(name);
-        if (value === undefined) {
-          return yield* Effect.fail(new StackMetadataNotFoundError({ name }));
-        }
-        return value;
-      }),
-    scanMetadata: () => Effect.sync(() => new Map(metadata)),
-    remove: (name: string) =>
-      Effect.sync(() => {
-        states.delete(name);
-      }),
-    deleteStack: (name: string) =>
-      Effect.sync(() => {
-        states.delete(name);
-        metadata.delete(name);
-      }),
-    resolve: (cwd: string) =>
-      Effect.gen(function* () {
-        const state = Array.from(states.values())[0];
-        if (state === undefined) {
-          return yield* Effect.fail(new NoRunningStackError({ cwd }));
-        }
-        return state;
-      }),
-    isAlive: () => Effect.succeed(true),
-  });
 }
 
 export function mockProjectLinkState(
@@ -1022,13 +806,13 @@ export function mockProjectLinkRemote(
   );
 }
 
-export function mockProjectLocalServiceVersions(
+export function mockCliProjectLocalServiceVersions(
   initialState?: LocalServiceVersionsState,
-): Layer.Layer<ProjectLocalServiceVersions, never, never> {
+): Layer.Layer<CliProjectLocalServiceVersions, never, never> {
   let state = initialState;
   return Layer.succeed(
-    ProjectLocalServiceVersions,
-    ProjectLocalServiceVersions.of({
+    CliProjectLocalServiceVersions,
+    CliProjectLocalServiceVersions.of({
       load: Effect.sync(() =>
         state === undefined ? Option.none<LocalServiceVersionsState>() : Option.some(state),
       ),
@@ -1038,51 +822,44 @@ export function mockProjectLocalServiceVersions(
 
 export function emptyEnv() {
   const runtimeInfoLayer = mockRuntimeInfo();
-  const projectContextLayer = mockProjectContext();
+  const cliProjectContextLayer = mockCliProjectContext();
   const envLayer = processEnvLayer();
-  const projectHomeLayer = mockProjectHome();
+  const cliProjectHomeLayer = mockCliProjectHome();
   const projectLinkStateLayer = mockProjectLinkState();
-  const projectLocalServiceVersionsLayer = mockProjectLocalServiceVersions();
-  const stateManagerLayer = mockStateManager();
+  const cliProjectLocalServiceVersionsLayer = mockCliProjectLocalServiceVersions();
   const analytics = mockAnalytics();
   return Layer.mergeAll(
     BunServices.layer,
     runtimeInfoLayer,
-    projectContextLayer,
-    projectHomeLayer,
+    cliProjectContextLayer,
+    cliProjectHomeLayer,
     projectLinkStateLayer,
-    projectLocalServiceVersionsLayer,
-    stateManagerLayer,
+    cliProjectLocalServiceVersionsLayer,
     analytics.layer,
     mockTelemetryRuntime(),
     envLayer,
     mockTty(),
     mockProcessControl().layer,
-    cliConfigLayer.pipe(Layer.provide(runtimeInfoLayer), Layer.provide(projectContextLayer)),
-    Layer.succeed(UnixHttpClient, {
-      request: () => Effect.die("unexpected UnixHttpClient access in tests"),
-    }),
+    cliSettingsLayer.pipe(Layer.provide(runtimeInfoLayer), Layer.provide(cliProjectContextLayer)),
   );
 }
 
 export function withEnv(env: Record<string, string>) {
   const runtimeInfoLayer = mockRuntimeInfo();
-  const projectContextLayer = mockProjectContext();
+  const cliProjectContextLayer = mockCliProjectContext();
   const envLayer = processEnvLayer(env);
-  const projectHomeLayer = mockProjectHome();
-  const stateManagerLayer = mockStateManager();
+  const cliProjectHomeLayer = mockCliProjectHome();
   const analytics = mockAnalytics();
   return Layer.mergeAll(
     BunServices.layer,
     runtimeInfoLayer,
-    projectContextLayer,
-    projectHomeLayer,
-    stateManagerLayer,
+    cliProjectContextLayer,
+    cliProjectHomeLayer,
     analytics.layer,
     mockTelemetryRuntime(),
     envLayer,
     mockTty(),
     mockProcessControl().layer,
-    cliConfigLayer.pipe(Layer.provide(runtimeInfoLayer), Layer.provide(projectContextLayer)),
+    cliSettingsLayer.pipe(Layer.provide(runtimeInfoLayer), Layer.provide(cliProjectContextLayer)),
   );
 }

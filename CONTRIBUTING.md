@@ -2,13 +2,79 @@
 
 Bun monorepo for exploring the next generation of the Supabase CLI and local development stack.
 
+## Contribution workflow
+
+Before you open a pull request:
+
+1. **Open an issue first**, using one of the [issue templates](https://github.com/supabase/cli/issues/new/choose).
+2. **Wait for maintainer triage.** A maintainer categorizes the issue (`✨ Feature`, `🐛 Bug`, or `📘 Docs`) and adds the **`open-for-contribution`** label once it is ready to be worked on.
+3. **Open a pull request only after the `open-for-contribution` label is set**, and link the issue with a closing keyword (for example `Closes #123`).
+
+Until the `open-for-contribution` label is present, the issue is still in triage, so work should not start and a pull request should not be opened.
+
+Pull requests from external contributors that do not follow this workflow are commented on and closed automatically by the [Contribution Gate](.github/workflows/contribution-gate.yml). Supabase members are exempt, so they can work from Linear tickets that are not public on GitHub. Maintainers: see [`.github/MAINTAINERS.md`](.github/MAINTAINERS.md).
+
 ## Setup
+
+### Tool versions
+
+This repo pins the versions of Node, Bun, Go, pnpm, and golangci-lint that contributors are expected to build against, and uses [`mise`](https://mise.jdx.dev/) — a polyglot version manager — to install and activate them automatically. If you don't already have these tools installed, `mise` is a great way to get up and running quickly.
+
+#### Installing mise
+
+```sh
+# macOS / Linux
+curl https://mise.run | sh
+
+# macOS via Homebrew
+brew install mise
+```
+
+See the [`mise` installation docs](https://mise.jdx.dev/getting-started.html) for other package managers (apt, dnf, cargo, npm, Windows, …).
+
+`mise` needs to hook into your shell so it can inject the right tool versions into your `PATH` as you move between directories. Follow the `mise activate` instructions [in this section](https://mise.jdx.dev/getting-started.html#activate-mise) to add the activation line for your shell to its startup file.
+
+#### Installing the pinned tool versions
+
+Trust this repo's `mise.toml` once from the repo root so `mise` can read the project setting that enables idiomatic version files:
+
+```sh
+mise trust
+```
+
+Then install the pinned tool versions:
+
+```sh
+mise install
+```
+
+`mise install` resolves the versions this repo expects from a handful of files, rather than hardcoding them all in one place:
+
+| Tool          | Version source                                      |
+| ------------- | --------------------------------------------------- |
+| Bun           | `.bun-version`                                      |
+| Node.js       | `.node-version`                                     |
+| pnpm          | `devEngines.packageManager` field in `package.json` |
+| Go            | `mise.toml`                                         |
+| golangci-lint | `mise.toml`                                         |
+
+The Go and golangci-lint entries in `mise.toml` are intentionally temporary while the Go CLI remains in the repo. The canonical Go module metadata still lives in `apps/cli-go/go.mod`; keep the `mise.toml` entries aligned only until the Go code is removed.
+
+Once installed, `mise` activates these versions automatically whenever your shell is inside this repo — no manual `nvm use`, `gvm use`, or similar switching required.
+
+#### Without mise
+
+`mise` is not required. If you already have Bun, Node, pnpm, and Go installed and managed some other way, just make sure your versions match the ones pinned in `.bun-version`, `.node-version`, `mise.toml`, `package.json`, and `apps/cli-go/go.mod`.
+
+### Install dependencies
 
 Install workspace dependencies:
 
 ```sh
 pnpm install
 ```
+
+This also installs a local `commit-msg` git hook (via husky) that validates your commit messages against `commitlint.config.js` — see [Pull Requests](AGENTS.md#pull-requests) for the allowed types and scopes.
 
 Clone the reference submodules used during development:
 
@@ -28,39 +94,36 @@ That pulls `.repos/effect/`, which is the local source of truth for Effect v4 AP
 |-- packages/
 |   |-- api/                  # Typed Supabase Management API client
 |   |-- config/               # Supabase config schema and generated types
-|   |-- process-compose/      # Effect-based process orchestration library
 |   |-- stack/                # Programmatic local Supabase stack runtime
 |   `-- cli-*/                # Platform-specific CLI binary packages
-|-- tools/
-|   `-- nx-plugins/           # Local Nx inference plugins
+|-- tools/                    # Repository tooling (release scripts, etc.)
 |-- docs/                     # ADRs, design notes, and implementation docs
 `-- .repos/effect/            # Effect v4 reference source
 ```
 
 ## Apps
 
-| Workspace | Purpose |
-| --- | --- |
-| `apps/cli` | Main `supabase` package. Contains command handlers, runtime services, auth, output, telemetry, and docs generation scripts. |
-| `apps/cli-e2e` | Compatibility e2e test suite. Record-and-replay harness for parity testing between the Go CLI and the TS Legacy port. |
-| `apps/docs` | Internal docs site built with Next.js and generated from the CLI docs sources. |
+| Workspace      | Purpose                                                                                                                                |
+| -------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| `apps/cli`     | Main `supabase` package. Contains command handlers, runtime services, auth, output, telemetry, and docs generation scripts.            |
+| `apps/cli-e2e` | Compatibility e2e test suite. Record-and-replay harness for testing the TypeScript CLI against real Supabase Management API responses. |
+| `apps/docs`    | Internal docs site built with Next.js and generated from the CLI docs sources.                                                         |
 
 ## Packages
 
-| Workspace | Purpose |
-| --- | --- |
-| `packages/api` | Auto-generated TypeScript client for the Supabase Management API. |
-| `packages/cli-test-helpers` | CLI test harness library — `createHarness`/`exec` API for spawning Go, TS Legacy, and TS Next CLI subprocesses in tests. |
-| `packages/config` | JSON Schema and generated TypeScript types for Supabase configuration. |
-| `packages/process-compose` | TypeScript/Bun port of `process-compose` used for multi-service orchestration. |
-| `packages/stack` | Programmatic local Supabase stack used by the CLI and other tooling. |
-| `packages/cli-darwin-arm64` | Published native CLI binary wrapper for macOS arm64. |
-| `packages/cli-darwin-x64` | Published native CLI binary wrapper for macOS x64. |
-| `packages/cli-linux-arm64` | Published native CLI binary wrapper for Linux arm64 (glibc). |
-| `packages/cli-linux-arm64-musl` | Published native CLI binary wrapper for Linux arm64 (musl). |
-| `packages/cli-linux-x64` | Published native CLI binary wrapper for Linux x64 (glibc). |
-| `packages/cli-linux-x64-musl` | Published native CLI binary wrapper for Linux x64 (musl). |
-| `packages/cli-windows-x64` | Published native CLI binary wrapper for Windows x64. |
+| Workspace                       | Purpose                                                                                       |
+| ------------------------------- | --------------------------------------------------------------------------------------------- |
+| `packages/api`                  | Auto-generated TypeScript client for the Supabase Management API.                             |
+| `packages/cli-test-helpers`     | CLI test harness library — `createHarness`/`exec` API for spawning CLI subprocesses in tests. |
+| `packages/config`               | JSON Schema and generated TypeScript types for Supabase configuration.                        |
+| `packages/stack`                | Programmatic local Supabase stack used by the CLI and other tooling.                          |
+| `packages/cli-darwin-arm64`     | Published native CLI binary wrapper for macOS arm64.                                          |
+| `packages/cli-darwin-x64`       | Published native CLI binary wrapper for macOS x64.                                            |
+| `packages/cli-linux-arm64`      | Published native CLI binary wrapper for Linux arm64 (glibc).                                  |
+| `packages/cli-linux-arm64-musl` | Published native CLI binary wrapper for Linux arm64 (musl).                                   |
+| `packages/cli-linux-x64`        | Published native CLI binary wrapper for Linux x64 (glibc).                                    |
+| `packages/cli-linux-x64-musl`   | Published native CLI binary wrapper for Linux x64 (musl).                                     |
+| `packages/cli-windows-x64`      | Published native CLI binary wrapper for Windows x64.                                          |
 
 ## Working In The Monorepo
 
@@ -69,72 +132,100 @@ Root-level scripts:
 ```sh
 pnpm run repos:install
 pnpm run repos:pull
+pnpm run build       # build CLI, config, and docs artifacts with Turbo
+pnpm run generate    # generate API, then documentation artifacts with Turbo
 pnpm run check:all   # run all checks across every project
 pnpm run fix:all     # run all fixers across every project
 ```
 
 ### Standard package scripts
 
-All standard TypeScript workspaces (`apps/cli`, `packages/api`, `packages/config`, `packages/process-compose`, `packages/stack`) expose the following scripts:
+Standard TypeScript workspaces (`apps/cli-e2e`, `apps/cli`, `packages/api`, `packages/cli-test-helpers`, `packages/config`, `packages/stack`) declare their package scripts explicitly. Test suites vary by package: unit tests are standard, while integration and e2e tests exist only where applicable.
 
-| Script | What it does |
-|--------|--------------|
-| `test` | Run the full test suite (unit + integration + e2e) |
-| `test:core` | Run unit and integration tests |
-| `test:unit` | Run unit tests _(inferred by Nx plugin)_ |
-| `test:integration` | Run integration tests _(inferred by Nx plugin)_ |
-| `test:e2e` | Run end-to-end tests _(inferred by Nx plugin)_ |
-| `check:all` | Run all check targets for this project |
-| `fix:all` | Run all fix targets for this project |
-| `types:check` | Type-check with `tsgo --noEmit` _(inferred by Nx plugin)_ |
-| `lint:check` | Check for lint errors with `oxlint` _(inferred by Nx plugin)_ |
-| `lint:fix` | Auto-fix lint errors _(inferred by Nx plugin)_ |
-| `fmt:check` | Check formatting with `oxfmt --check` _(inferred by Nx plugin)_ |
-| `fmt:fix` | Auto-fix formatting _(inferred by Nx plugin)_ |
-| `knip:check` | Find unused exports and dependencies with `knip-bun` _(inferred by Nx plugin)_ |
-| `knip:fix` | Auto-remove unused exports and dependencies _(inferred by Nx plugin)_ |
+| Script             | What it does                           |
+| ------------------ | -------------------------------------- |
+| `test`             | Run the package's declared test suites |
+| `test:unit`        | Run unit tests                         |
+| `test:integration` | Run integration tests where applicable |
+| `test:e2e`         | Run end-to-end tests where applicable  |
+| `types:check`      | Type-check with `tsc --noEmit`         |
 
-The inferred scripts (`test:unit`, `test:integration`, `test:e2e`, `types:check`, `lint:*`, `fmt:*`, `knip:*`) are not declared in `package.json` — they are injected by local Nx plugins in `tools/nx-plugins/`. They are fully cached and can be discovered via `nx show project <name>`.
+The test and type-check scripts are declared in each package's `package.json`, so package-local commands are directly discoverable and can be sharded independently.
 
-Quality checks are run from the workspace you are changing:
+Linting, formatting, and unused-code analysis are repo-wide rather than per-package: `oxlint`, `oxfmt`, and `knip` read `.oxlintrc.json`, `.oxfmtrc.json`, and `knip.json` at the repo root (knip's config maps each workspace under its `workspaces` key). The root `check:all`/`fix:all` scripts are the sole repo-wide quality entrypoints and use Turbo to run the package type checks and root-owned quality scripts. Package-local work can run `pnpm types:check` and the package's test scripts. Running the tools directly from the repository root also just works:
+
+```sh
+pnpm exec oxlint
+pnpm exec oxfmt
+pnpm exec knip-bun
+```
+
+Package-local type checks and tests can be run from the workspace you are changing:
 
 ```sh
 # From a project directory — scoped to that project only:
+pnpm types:check
+pnpm run test:unit
+# If this package declares an integration suite:
+pnpm run test:integration
+
+# From the workspace root — repo-wide quality and all-project test fan-out:
 pnpm run check:all
 pnpm run fix:all
-pnpm run test
-
-# From the workspace root — runs across all projects:
-pnpm run check:all
+pnpm run test:unit && pnpm run test:integration
 ```
+
+The root unit and integration scripts use Turbo to fan out the package-local
+`test:*:run` tasks across the standard TypeScript/Vitest workspaces. The Go
+workspace remains package-local because its tests run directly through Go:
+`pnpm --dir apps/cli-go run test:unit`. Go tests are covered by the dedicated
+Go CI workflow. Unit and integration tasks are uncached for now; e2e tasks are
+also uncached and run one package at a time. Forward a Vitest shard to every
+e2e package with `pnpm run test:e2e --shard=1/3`.
 
 ## E2E Compatibility Test Suite
 
-`apps/cli-e2e` implements a record-and-replay test harness for verifying behavioral parity between the Go CLI and the TypeScript Legacy port.
+`apps/cli-e2e` implements the replay-and-record compatibility harness for the TypeScript CLI. Live tests are owned by `apps/cli` and run from the command they cover. The CLI still shells out to the bundled Go binary for the handful of commands the TS port proxies (`db diff --use-pg-schema`, `db branch *`, `db remote changes`, `gen keys`, `functions download`), so `apps/cli-go/` is built alongside the TS CLI for these suites, but there is no Go-vs-TypeScript parity runner.
 
 ### Architecture
 
-**The Go CLI is the source of truth.** Fixtures are recorded by running the Go CLI against the Supabase staging API. The TypeScript Legacy CLI is then run against the same fixtures to verify that its output matches.
+Replay fixtures are recorded by running the CLI against the real Supabase staging API and capturing request/response pairs. Replay runs serve those committed fixtures back to the same CLI, so compatibility tests are fast and deterministic with no network access. The replay/record suite remains entirely under `apps/cli-e2e`.
 
-The harness works in three modes:
+The replay/record harness has two modes:
 
-| Mode | When | What it does |
-|------|------|-------------|
-| **Replay** (default) | Every PR / local dev | Loads committed fixtures; serves recorded responses to the CLI subprocess. Fast and deterministic — no network access. Default target is `ts-legacy`. |
-| **Record** | `RECORD=true` | Proxies CLI traffic to staging and captures request/response pairs as fixture files. Only the Go harness is used for recording. |
-| **Parity** | `CLI_HARNESS_TARGET=go` | Runs the Go CLI against the committed fixtures — useful for verifying fixture correctness independently of the TS port. |
+| Mode                 | When                 | What it does                                                                                                           |
+| -------------------- | -------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| **Replay** (default) | Every PR / local dev | Loads committed fixtures; serves recorded responses to the CLI subprocess. Fast and deterministic — no network access. |
+| **Record**           | `RECORD=true`        | Proxies CLI traffic to staging and captures request/response pairs as fixture files.                                   |
+
+### Live remote-project coverage
+
+The live suite lives in `apps/cli/src/**` as collocated `*.live.test.ts` files and runs in the CLI package's separate, serial `live` Vitest project. Global setup requires `SUPABASE_LIVE_API_URL` and `SUPABASE_ACCESS_TOKEN`, then provisions one uniquely named project through the typed Management API client, waits for it to become healthy, creates the shared storage fixture, and writes a temporary YAML profile. Every live subprocess receives that profile, so the same contract works with Supabox, a Docker-hosted API platform, or staging by changing only the URL and token. Teardown always removes the temporary profile and deletes the exact owned project unless `SUPABASE_LIVE_KEEP_PROJECT=1` is set.
+
+The configured URL is the Management API endpoint. Tenant data-plane URLs keep
+the CLI profile contract (`https://<ref>.<project_host>`) using the host derived
+from the provisioned project's database metadata.
+
+Live coverage is smoke coverage, not an exhaustive command matrix. Add one representative golden-path test for each user-facing command, colocated beside that command. A live test should assert one target command; setup and teardown may invoke other commands when they prepare or clean up state, but those commands are not asserted in that test. Keep validation, formatting, fallback, error, and matrix details in integration tests unless the remote/runtime boundary itself is the behavior under test. See [ADR 0013](docs/adr/0013-live-e2e-bypasses-replay-server.md) and [`apps/cli/live.env.example`](apps/cli/live.env.example).
+
+To run the live suite locally, copy [`apps/cli/live.env.example`](apps/cli/live.env.example), set the API URL and access token for the target platform, and run the root Turbo entrypoint. Its build dependency prepares the CLI artifacts before Vitest starts:
+
+```sh
+pnpm run test:live
+```
+
+Optional `SUPABASE_LIVE_ORG_ID`, `SUPABASE_LIVE_REGION`, and
+`SUPABASE_LIVE_PROJECT_NAME` values select provisioning details. Set
+`SUPABASE_LIVE_KEEP_PROJECT=1` only when debugging a failed run; the temporary
+profile is still cleaned up.
+
+Live CI is manual or daily scheduled and is not PR-blocking; run it manually on a PR branch when you need pre-merge remote coverage.
 
 ### Running the tests
 
 ```sh
 # Replay mode — fast, no credentials needed
-cd apps/cli-e2e
-pnpm test            # TS Legacy parity check (default)
-pnpm test:go         # Go harness explicitly
-pnpm test:legacy     # TS Legacy parity check (explicit, same as above)
-
-# Or via Nx from the repo root
-nx run @supabase/cli-e2e:test:e2e
+pnpm exec turbo run @supabase/cli-e2e#test:e2e:run
 ```
 
 ### Recording fixtures
@@ -142,27 +233,26 @@ nx run @supabase/cli-e2e:test:e2e
 Recording proxies CLI traffic to the Supabase staging API. Provide a staging access token and a project ref for commands that need one — everything else is baked into the script:
 
 ```sh
-cd apps/cli-e2e
-SUPABASE_ACCESS_TOKEN=<your-staging-token> SUPABASE_TEST_PROJECT_REF=<your-project-ref> SUPABASE_STAGING_URL=<stagingUrl> pnpm record
+SUPABASE_ACCESS_TOKEN=<your-staging-token> SUPABASE_TEST_PROJECT_REF=<your-project-ref> SUPABASE_STAGING_URL=<stagingUrl> pnpm run record
 ```
 
 Review the generated files in `apps/cli-e2e/fixtures/recorded/` before committing — verify that no real tokens, UUIDs, or project refs appear (they should be replaced with `__ACCESS_TOKEN__`, `__UUID__`, `__PROJECT_REF__` placeholders).
 
-### Verifying parity
+### Verifying fixtures
 
-After recording, run the TS Legacy CLI against the committed fixtures:
+After recording, replay must pass with no changes against the freshly committed fixtures:
 
 ```sh
-pnpm test:legacy
+pnpm exec turbo run @supabase/cli-e2e#test:e2e:run
 ```
 
-Failing tests identify commands where the TS Legacy port does not yet match the Go CLI output.
+A test failing only after a recording session usually means an assertion needs updating to match the CLI's current real-world output, not the fixture.
 
 ### Fixture layout
 
 ```text
 apps/cli-e2e/fixtures/
-├── recorded/           # Committed fixture pairs (Go CLI = source of truth)
+├── recorded/           # Committed fixture pairs, captured from real staging responses
 │   └── <KEY>/          # e.g. GET_v1_projects/
 │       ├── default.request.json
 │       └── default.response.json
@@ -179,7 +269,7 @@ Test code imports from `@supabase/cli-test-helpers` (`packages/cli-test-helpers`
 ```ts
 import { createHarness, exec } from "@supabase/cli-test-helpers";
 
-const harness = createHarness("go", { apiUrl, accessToken });
+const harness = createHarness({ apiUrl, accessToken });
 const result = await exec(harness, ["projects", "list"]);
 ```
 
@@ -192,7 +282,7 @@ Test a real end-to-end publish and install of the CLI against a local npm regist
 ### Prerequisites
 
 - **Bun** — for compiling the CLI binary and running the scripts
-- **Go** — only required for `--legacy` shell (commands proxied to the Go binary)
+- **Go** — required to build the `supabase-go` sidecar (commands proxied to the Go binary)
 - **pnpm** — already required by this repo
 - **Node.js** — required by `npx` / `npm install -g` to test the published package
 
@@ -204,19 +294,16 @@ Test a real end-to-end publish and install of the CLI against a local npm regist
 pnpm local-registry
 ```
 
-This starts Verdaccio on `http://localhost:4873`, creates a publish user, and redirects the global `npm` and `pnpm` registry config to `localhost`. Press **Ctrl+C** when done — the original registry settings are restored automatically.
+This starts Verdaccio on `http://localhost:4873` and creates a publish user. Your global `npm` and `pnpm` registry config is never modified — every command that talks to the local registry passes `--registry` explicitly. Press **Ctrl+C** when done.
 
 **Terminal 2 — build and publish:**
 
 ```sh
-# Publish the next (TypeScript-native) shell
-pnpm cli-release --next
-
-# Or publish the legacy (Go-backed) shell
-pnpm cli-release --legacy
+# Build and publish the CLI
+pnpm cli-release
 
 # Pin a specific version (default: 0.0.0-local.<epoch-seconds>)
-pnpm cli-release --next --version 0.0.0-local.1
+pnpm cli-release --version 0.0.0-local.1
 ```
 
 The script builds the CLI binary for the current platform only, compiles the Node.js shim, and publishes two packages to the local registry:
@@ -239,70 +326,61 @@ supabase --version
 
 ### Troubleshooting
 
-| Problem | Fix |
-|---------|-----|
-| `Error: Something is already running on port 4873` | Kill the leftover Verdaccio process (`lsof -ti:4873 \| xargs kill`) and retry |
-| `go not found in PATH` (legacy only) | Install Go from https://go.dev/dl/ |
-| `Error: Go CLI source not found` (legacy only) | Run `pnpm repos:install` to clone `apps/cli-go` |
-| Registry not restored after crash | Run `npm config set registry https://registry.npmjs.org/` and `pnpm config set registry https://registry.npmjs.org/` |
-| `npx` resolves from npm instead of local | Pass `--registry http://localhost:4873` explicitly to `npx` / `npm install` |
+| Problem                                                                         | Fix                                                                                                                                                                                                                                                                                                                                                                                                             |
+| ------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Error: Something is already running on port 4873`                              | Kill the leftover Verdaccio process (`lsof -ti:4873 \| xargs kill`) and retry                                                                                                                                                                                                                                                                                                                                   |
+| `go not found in PATH`                                                          | Install Go from https://go.dev/dl/                                                                                                                                                                                                                                                                                                                                                                              |
+| `Error: Go CLI source not found`                                                | Run `pnpm repos:install` to clone `apps/cli-go`                                                                                                                                                                                                                                                                                                                                                                 |
+| `npm` / `pnpm` tries to fetch from `localhost:4873` when no registry is running | Stale global registry override left behind by an older version of `local-registry.ts` (the current script never modifies global config). Run `npm config delete registry` and `pnpm config delete registry`. Note that pnpm stores the override in its own global config (`~/Library/Preferences/pnpm/auth.ini` on macOS, `~/.config/pnpm/` on Linux), not `~/.npmrc` — check there if the delete command fails |
+| `npx` resolves from npm instead of local                                        | Pass `--registry http://localhost:4873` explicitly to `npx` / `npm install`                                                                                                                                                                                                                                                                                                                                     |
 
-## Using Nx
+## Using Turbo
 
-Nx is the task runner for this repo. It handles caching, parallelism, and cross-project orchestration. All tasks — whether declared in a project's `package.json` or inferred by a plugin — are invoked the same way.
+Turbo owns repository task execution and dependency graph orchestration. Quality
+checks are root-owned `check:all`/`fix:all` scripts orchestrated with Turbo,
+while ordinary unit, integration, and e2e tests remain package-local scripts;
+see [Standard package scripts](#standard-package-scripts).
 
-**Run a single target:**
-
-```sh
-nx run @supabase/api:knip:check
-nx run supabase:test
-```
-
-**Run a target across all projects:**
+Inspect a task's dependency graph with Turbo's JSON dry-run output:
 
 ```sh
-nx run-many -t knip:check
-nx run-many -t lint:check fmt:check types:check knip:check
+pnpm exec turbo run <task> --dry=json
 ```
 
-**Run only affected projects** (compared to `main`):
+**Build all migrated workspaces:**
 
 ```sh
-nx affected -t test
-nx affected -t lint:check fmt:check types:check knip:check
+pnpm run build
 ```
 
-**Inspect a project's full task configuration** (including inferred targets):
+**Generate API and documentation artifacts:**
 
 ```sh
-nx show project @supabase/api
+pnpm run generate
 ```
 
-This is the best way to see what targets exist on a project, what their inputs and outputs are, and whether they are cached. Some targets are not declared in `package.json` but are injected by local Nx plugins — `knip:check` and `knip:fix` are examples of this.
-
-### Caching
-
-Nx caches task results locally under `.nx/cache`. A target hits the cache when all its inputs are unchanged since the last successful run — inputs include source files, named input sets like `sharedGlobals`, and external dependency versions.
-
-To force a re-run and bypass the cache:
+**Build only the CLI and its Go sidecar:**
 
 ```sh
-nx run @supabase/api:knip:check --skip-nx-cache
+pnpm exec turbo run supabase#build
 ```
 
-To clear all cached results:
+The CLI build names its config and Go build prerequisites explicitly. The
+remaining CLI workspace dependencies intentionally have no build script, so
+strict Turbo task selection does not synthesize no-op `^build` tasks for them.
+
+**Run the live suite:**
+
+The target's uncached build dependency prepares the CLI artifacts before Vitest
+starts; use Turbo for cacheable build outputs.
 
 ```sh
-nx reset
+pnpm run test:live
 ```
 
-### Inferred targets
-
-Several targets in this repo are not explicitly declared in any project file. They are injected by local plugins in `tools/nx-plugins/` that inspect each package's `package.json` and derive targets from the tooling configuration found there.
-
-To see the full list of targets for a project, always use `nx show project` rather than reading the `nx.targets` field in `package.json` directly.
-
-See [`docs/nx-inference-plugins.md`](docs/nx-inference-plugins.md) for how the plugin system works and how to add new plugins.
+Run `pnpm run check:all` or `pnpm run fix:all` from the repository root for
+repo-wide quality checks. Package-local checks use `pnpm types:check` plus the
+package's test scripts.
 
 ## Documentation
 

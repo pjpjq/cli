@@ -32,6 +32,18 @@ const inspectRule = Schema.Struct({
 }).pipe(Schema.withDecodingDefaultKey(Effect.succeed({})));
 
 export const experimental = Schema.Struct({
+  compute: Schema.optionalKey(
+    Schema.Boolean.annotate({
+      description: "Enable the experimental compute command family.",
+      tags,
+    }),
+  ),
+  stack: Schema.optionalKey(
+    Schema.Boolean.annotate({
+      description: "Use the new local stack backend for top-level start and stop commands.",
+      tags,
+    }),
+  ),
   orioledb_version: Schema.optionalKey(
     Schema.String.annotate({
       description: "Postgres storage engine version for OrioleDB.",
@@ -86,14 +98,15 @@ export const experimental = Schema.Struct({
       declarative_schema_path: Schema.optionalKey(
         Schema.String.annotate({
           description: "Directory under supabase/ where declarative schema files are written.",
-          examples: ["./database"],
+          examples: ["./schemas"],
           tags,
         }),
       ),
       format_options: Schema.optionalKey(
         Schema.String.annotate({
-          description: "JSON string passed through to pg-delta SQL formatting.",
-          examples: ['{"keywordCase":"upper","indent":2,"maxWidth":80,"commaStyle":"trailing"}'],
+          description:
+            'JSON string passed through to pg-delta SQL formatting. When omitted, SQL is formatted with uppercase keywords, indent 2, max width 180, trailing commas, and column/key alignment. Set to "null" to emit raw, unformatted SQL.',
+          examples: ['{"keywordCase":"upper","indent":2,"maxWidth":180,"commaStyle":"trailing"}'],
           tags,
         }),
       ),

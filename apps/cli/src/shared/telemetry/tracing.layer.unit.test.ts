@@ -13,19 +13,15 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { Effect, Exit, Layer, Option, Context, Tracer } from "effect";
-import { cliConfigLayer } from "../../next/config/cli-config.layer.ts";
+import { cliSettingsLayer } from "../config/cli-settings.layer.ts";
 import type { TelemetryConfig } from "./types.ts";
 import {
-  mockProjectContext,
+  mockCliProjectContext,
   mockRuntimeInfo,
   mockTty,
   processEnvLayer,
 } from "../../../tests/helpers/mocks.ts";
 import { tracingLayer } from "./tracing.layer.ts";
-
-// ---------------------------------------------------------------------------
-// Filesystem helpers
-// ---------------------------------------------------------------------------
 
 const fsLayer = BunServices.layer;
 
@@ -38,10 +34,6 @@ function writeConfig(dir: string, config: TelemetryConfig): void {
   writeFileSync(path.join(dir, "telemetry.json"), JSON.stringify(config));
 }
 
-// ---------------------------------------------------------------------------
-// Layer builder helpers
-// ---------------------------------------------------------------------------
-
 function buildLayer(opts: { home: string; env?: Record<string, string>; stdoutIsTty?: boolean }) {
   const env: Record<string, string> = {
     HOME: opts.home,
@@ -53,13 +45,13 @@ function buildLayer(opts: { home: string; env?: Record<string, string>; stdoutIs
     platform: "linux",
     arch: "x64",
   });
-  const projectContextLayer = mockProjectContext();
+  const cliProjectContextLayer = mockCliProjectContext();
   return Layer.mergeAll(
     fsLayer,
     runtimeInfoLayer,
-    projectContextLayer,
+    cliProjectContextLayer,
     processEnvLayer(env),
-    cliConfigLayer.pipe(Layer.provide(runtimeInfoLayer), Layer.provide(projectContextLayer)),
+    cliSettingsLayer.pipe(Layer.provide(runtimeInfoLayer), Layer.provide(cliProjectContextLayer)),
     mockTty({
       stdoutIsTty: opts.stdoutIsTty ?? false,
       stdinIsTty: false,
@@ -74,10 +66,6 @@ function buildTracingLayer(opts: {
 }) {
   return tracingLayer.pipe(Layer.provide(buildLayer(opts)));
 }
-
-// ---------------------------------------------------------------------------
-// Span factory helper (mirrors ExportableSpan constructor options)
-// ---------------------------------------------------------------------------
 
 function makeSpanOptions(
   overrides: Partial<{
@@ -97,10 +85,6 @@ function makeSpanOptions(
     sampled: overrides.sampled ?? true,
   };
 }
-
-// ---------------------------------------------------------------------------
-// Layer construction & first-run
-// ---------------------------------------------------------------------------
 
 describe("tracingLayer – layer construction & first-run", () => {
   it.live("first-run TTY: creates telemetry.json with consent=granted", () => {
@@ -196,10 +180,6 @@ describe("tracingLayer – layer construction & first-run", () => {
   );
 });
 
-// ---------------------------------------------------------------------------
-// Span behaviour
-// ---------------------------------------------------------------------------
-
 describe("tracingLayer – span behaviour", () => {
   it.live("span creation attaches global attributes", () => {
     const home = makeTempDir();
@@ -237,6 +217,33 @@ describe("tracingLayer – span behaviour", () => {
             existsSync(tracesDir) && readdirSync(tracesDir).some((f) => f.endsWith(".ndjson"));
           expect(hasNdjson).toBe(true);
           rmSync(home, { recursive: true, force: true });
+        }),
+      ),
+    );
+  });
+
+  it.live("does not write API keys to trace files", () => {
+    const home = makeTempDir();
+    const tracesDir = path.join(home, ".supabase", "traces");
+    const secretKey = `sb_secret_${"a".repeat(40)}`;
+    return Effect.gen(function* () {
+      const tracer = yield* Tracer.Tracer;
+      const span = tracer.span(makeSpanOptions());
+      span.attribute("http.request.header.apikey", secretKey);
+      span.end(BigInt(Date.now() + 100) * 1_000_000n, Exit.void);
+    }).pipe(
+      Effect.provide(buildTracingLayer({ home })),
+      Effect.ensuring(
+        Effect.sync(() => {
+          try {
+            const traceFile = readdirSync(tracesDir).find((file) => file.endsWith(".ndjson"));
+            expect(traceFile).toBeDefined();
+            const trace = readFileSync(path.join(tracesDir, traceFile!), "utf8");
+            expect(trace).not.toContain(secretKey);
+            expect(trace).not.toContain("http.request.header.apikey");
+          } finally {
+            rmSync(home, { recursive: true, force: true });
+          }
         }),
       ),
     );
@@ -348,10 +355,6 @@ describe("tracingLayer – span behaviour", () => {
     );
   });
 });
-
-// ---------------------------------------------------------------------------
-// ExportableSpan unit tests
-// ---------------------------------------------------------------------------
 
 describe("ExportableSpan unit tests", () => {
   it.live("child span inherits traceId from parent span", () => {

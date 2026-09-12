@@ -2,43 +2,55 @@ name: Publish Preview CLI Packages
 
 # Release-notes PRs (head ref `release-notes/*`) are markdown-only and are not
 # meant to produce installable preview packages.
+#
+# Opt-in by label: pkg.pr.new hosts large CLI binaries, so publish only when
+# someone needs a shareable install. Add `run-preview-packages` to publish
+# (and re-publish on each subsequent push while labeled); remove it to cancel
+# in-progress runs via this workflow's concurrency group.
 on:
   pull_request:
     types:
       - opened
       - synchronize
       - reopened
-      - ready_for_review
-    branches:
-      - develop
+      - labeled
+      - unlabeled
 
 permissions:
   actions: read
   contents: read
 
+# Unrelated label events still start a run; give them a unique group so they
+# cannot cancel an in-progress publish. Removing `run-preview-packages` stays
+# on the main group and cancels via cancel-in-progress.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref }}
+  group: >-
+    publish-preview-cli-packages.yml-${{ github.event.pull_request.number || github.ref }}${{
+      ((github.event.action == 'labeled' || github.event.action == 'unlabeled')
+        && github.event.label.name != 'run-preview-packages'
+        && format('-noop-{0}', github.run_id))
+      || ''
+    }}
   cancel-in-progress: true
 
 jobs:
   build:
     if: |
       !startsWith(github.head_ref, 'release-notes/') &&
-      github.event.pull_request.draft == false
+      contains(github.event.pull_request.labels.*.name, 'run-preview-packages') &&
+      ((github.event.action != 'labeled' &&
+          github.event.action != 'unlabeled') ||
+        github.event.label.name == 'run-preview-packages')
     name: Build preview CLI packages
     uses: ./.github/workflows/build-cli-artifacts.yml
     with:
       version: 0.0.0-pr.${{ github.event.pull_request.number }}
-      shell: legacy
     secrets:
       DF_FIREWALL_TOKEN: ${{ secrets.DF_FIREWALL_TOKEN }}
 
   publish:
     needs: build
-    if: |
-      !startsWith(github.head_ref, 'release-notes/') &&
-      github.event.pull_request.draft == false &&
-      needs.build.result == 'success'
+    if: needs.build.result == 'success'
     name: Publish preview package
     runs-on: blacksmith-8vcpu-ubuntu-2404
     outputs:
@@ -48,7 +60,7 @@ jobs:
       PR_NUMBER: ${{ github.event.pull_request.number }}
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -58,12 +70,12 @@ jobs:
           dependency-firewall-token: ${{ secrets.DF_FIREWALL_TOKEN }}
 
       - name: Restore preview build artifacts cache
-        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             packages/cli-*/bin/
             dist/
-          key: cli-build-${{ github.run_id }}-legacy-${{ env.PREVIEW_VERSION }}-v1
+          key: cli-build-${{ github.run_id }}-${{ env.PREVIEW_VERSION }}-v1
           enableCrossOsArchive: true
           fail-on-cache-miss: true
 
@@ -119,10 +131,7 @@ jobs:
 
   comment:
     needs: publish
-    if: |
-      !startsWith(github.head_ref, 'release-notes/') &&
-      github.event.pull_request.draft == false &&
-      needs.publish.result == 'success'
+    if: needs.publish.result == 'success'
     name: Post preview command comment
     runs-on: ubuntu-latest
     permissions:

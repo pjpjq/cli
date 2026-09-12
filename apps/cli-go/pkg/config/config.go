@@ -97,11 +97,48 @@ func (p *RequestPolicy) UnmarshalText(text []byte) error {
 
 type Glob []string
 
+type globOptions struct {
+	skipEmptyGlobs    bool
+	errorOnAllSkipped bool
+}
+
+type GlobOption func(*globOptions)
+
+func WithSkipEmptyGlobs() GlobOption {
+	return func(o *globOptions) {
+		o.skipEmptyGlobs = true
+	}
+}
+
+func WithErrorOnAllSkippedGlobs() GlobOption {
+	return func(o *globOptions) {
+		o.errorOnAllSkipped = true
+	}
+}
+
+func (g Glob) Files(fsys fs.FS, options ...GlobOption) ([]string, error) {
+	return g.files(fsys, nil, options...)
+}
+
+// SQLFiles matches glob patterns and expands directory matches recursively to
+// SQL files. Pattern order is preserved, and directory contents are sorted for
+// deterministic application.
+func (g Glob) SQLFiles(fsys fs.FS, options ...GlobOption) ([]string, error) {
+	return g.files(fsys, func(path string, entry fs.DirEntry) bool {
+		return entry.Type().IsRegular() && filepath.Ext(path) == ".sql"
+	}, options...)
+}
+
 // Match the glob patterns in the given FS to get a deduplicated
 // array of all migrations files to apply in the declared order.
-func (g Glob) Files(fsys fs.FS) ([]string, error) {
+func (g Glob) files(fsys fs.FS, expandDir func(string, fs.DirEntry) bool, options ...GlobOption) ([]string, error) {
+	opts := globOptions{}
+	for _, apply := range options {
+		apply(&opts)
+	}
 	var result []string
 	var allErrors []error
+	var skipped []string
 	set := make(map[string]struct{})
 	for _, pattern := range g {
 		// Glob expects / as path separator on windows
@@ -109,19 +146,70 @@ func (g Glob) Files(fsys fs.FS) ([]string, error) {
 		if err != nil {
 			allErrors = append(allErrors, errors.Errorf("failed to glob files: %w", err))
 		} else if len(matches) == 0 {
+			if opts.skipEmptyGlobs && hasGlobMeta(pattern) {
+				skipped = append(skipped, pattern)
+				continue
+			}
 			allErrors = append(allErrors, errors.Errorf("no files matched pattern: %s", pattern))
 		}
 		sort.Strings(matches)
 		// Remove duplicates
 		for _, item := range matches {
 			fp := filepath.ToSlash(item)
+			if expandDir != nil {
+				info, err := fs.Stat(fsys, fp)
+				if err != nil {
+					allErrors = append(allErrors, errors.Errorf("failed to stat matched file: %w", err))
+					continue
+				}
+				if info.IsDir() {
+					files, err := walkMatchedDir(fsys, fp, expandDir)
+					if err != nil {
+						allErrors = append(allErrors, err)
+						continue
+					}
+					for _, file := range files {
+						if _, exists := set[file]; !exists {
+							set[file] = struct{}{}
+							result = append(result, file)
+						}
+					}
+					continue
+				}
+			}
 			if _, exists := set[fp]; !exists {
 				set[fp] = struct{}{}
 				result = append(result, fp)
 			}
 		}
 	}
+	if opts.errorOnAllSkipped && len(result) == 0 && len(skipped) > 0 {
+		for _, pattern := range skipped {
+			allErrors = append(allErrors, errors.Errorf("no files matched pattern: %s", pattern))
+		}
+	}
 	return result, errors.Join(allErrors...)
+}
+
+func walkMatchedDir(fsys fs.FS, dir string, include func(string, fs.DirEntry) bool) ([]string, error) {
+	var files []string
+	if err := fs.WalkDir(fsys, dir, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if include(path, entry) {
+			files = append(files, filepath.ToSlash(path))
+		}
+		return nil
+	}); err != nil {
+		return nil, errors.Errorf("failed to walk matched directory: %w", err)
+	}
+	sort.Strings(files)
+	return files, nil
+}
+
+func hasGlobMeta(pattern string) bool {
+	return strings.ContainsAny(pattern, `*?[`)
 }
 
 // We follow these rules when adding new config:
@@ -151,6 +239,12 @@ type (
 		Functions    FunctionConfig `toml:"functions" json:"functions"`
 		Analytics    analytics      `toml:"analytics" json:"analytics"`
 		Experimental experimental   `toml:"experimental" json:"experimental"`
+		// Compute is parsed but never read here. The [compute] section is owned by
+		// the TS CLI; this field exists only so a config the TS schema accepts does
+		// not trip UnmarshalExact in the delegated Go child (`flags.LoadConfig`).
+		// The json tag is the one that matters: the decoder runs with
+		// dc.TagName = "json". Omitted from toml so Go never emits the section.
+		Compute map[string]any `toml:"-" json:"compute"`
 	}
 
 	config struct {
@@ -229,8 +323,6 @@ type (
 		Enabled               bool   `toml:"enabled" json:"enabled"`
 		DeclarativeSchemaPath string `toml:"declarative_schema_path" json:"declarative_schema_path"`
 		FormatOptions         string `toml:"format_options" json:"format_options"`
-		// NpmVersion is set from .temp/pgdelta-version during Load (not from TOML).
-		NpmVersion string `toml:"-" json:"-"`
 	}
 
 	inspect struct {
@@ -250,6 +342,8 @@ type (
 		S3Region        string         `toml:"s3_region" json:"s3_region"`
 		S3AccessKey     string         `toml:"s3_access_key" json:"s3_access_key"`
 		S3SecretKey     string         `toml:"s3_secret_key" json:"s3_secret_key"`
+		Stack           bool           `toml:"-" json:"stack"`
+		Compute         bool           `toml:"-" json:"compute"`
 		Webhooks        *webhooks      `toml:"webhooks" json:"webhooks"`
 		PgDelta         *PgDeltaConfig `toml:"pgdelta" json:"pgdelta"`
 		Inspect         inspect        `toml:"inspect" json:"inspect"`
@@ -774,16 +868,6 @@ func (c *config) Load(path string, fsys fs.FS, overrides ...ConfigEditor) error 
 	if version, err := fs.ReadFile(fsys, builder.LogflareVersionPath); err == nil && len(version) > 0 {
 		c.Analytics.Image = replaceImageTag(Images.Logflare, string(version))
 	}
-	v := DefaultPgDeltaNpmVersion
-	if version, err := fs.ReadFile(fsys, builder.PgDeltaVersionPath); err == nil {
-		if trimmed := strings.TrimSpace(string(version)); len(trimmed) > 0 {
-			v = trimmed
-		}
-	}
-	if c.Experimental.PgDelta == nil {
-		c.Experimental.PgDelta = &PgDeltaConfig{}
-	}
-	c.Experimental.PgDelta.NpmVersion = v
 	// TODO: replace derived config resolution with viper decode hooks
 	if err := c.resolve(builder, fsys); err != nil {
 		return err

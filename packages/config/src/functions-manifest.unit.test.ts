@@ -5,10 +5,10 @@ import { mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Effect, FileSystem, Path, Schema } from "effect";
-import { ProjectConfigSchema } from "./base.ts";
+import { CliConfigSchema } from "./base.ts";
 import { inferFunctionsManifest } from "./functions-manifest.ts";
 
-const decodeProjectConfig = Schema.decodeUnknownSync(ProjectConfigSchema);
+const decodeCliConfig = Schema.decodeUnknownSync(CliConfigSchema);
 
 function makeTempProject(): string {
   return mkdtempSync(join(tmpdir(), "supabase-functions-manifest-"));
@@ -81,7 +81,7 @@ describe("functions manifest", () => {
 
   test("applies config-only custom functions", async () => {
     const cwd = makeTempProject();
-    const config = decodeProjectConfig({
+    const config = decodeCliConfig({
       functions: {
         "custom-entrypoint": {
           entrypoint: "./functions/custom-entrypoint/main.ts",
@@ -114,7 +114,7 @@ describe("functions manifest", () => {
 
   test("uses slug defaults for config-only functions with non-path overrides", async () => {
     const cwd = makeTempProject();
-    const config = decodeProjectConfig({
+    const config = decodeCliConfig({
       functions: {
         "hello-world": {
           verify_jwt: false,
@@ -140,7 +140,7 @@ describe("functions manifest", () => {
 
   test("keeps disabled filesystem functions in the inferred manifest", async () => {
     const cwd = makeTempProject();
-    const config = decodeProjectConfig({
+    const config = decodeCliConfig({
       functions: {
         "hello-world": {
           enabled: false,
@@ -184,6 +184,36 @@ describe("functions manifest", () => {
       await expect(runConfigEffect(inferFunctionsManifest({ cwd }))).resolves.toEqual({});
     } finally {
       await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("search: false does not climb to an ancestor project's functions", async () => {
+    const projectRoot = makeTempProject();
+    const nestedCwd = join(projectRoot, "nested", "workdir");
+
+    try {
+      const functionDir = join(projectRoot, "supabase", "functions", "hello-world");
+      await mkdir(functionDir, { recursive: true });
+      await writeFile(join(functionDir, "index.ts"), "Deno.serve(() => new Response())\n");
+      await writeFile(join(projectRoot, "supabase", "config.json"), "{}\n");
+      await mkdir(nestedCwd, { recursive: true });
+
+      await expect(runConfigEffect(inferFunctionsManifest({ cwd: nestedCwd }))).resolves.toEqual({
+        "hello-world": {
+          enabled: true,
+          verify_jwt: true,
+          import_map: "",
+          entrypoint: "./functions/hello-world/index.ts",
+          static_files: [],
+          env: {},
+        },
+      });
+
+      await expect(
+        runConfigEffect(inferFunctionsManifest({ cwd: nestedCwd, search: false })),
+      ).resolves.toEqual({});
+    } finally {
+      await rm(projectRoot, { recursive: true, force: true });
     }
   });
 });

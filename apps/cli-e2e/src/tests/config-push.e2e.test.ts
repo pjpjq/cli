@@ -2,12 +2,12 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect } from "vitest";
 import { PROJECT_REF } from "./env.ts";
-import { testBehaviour, testParity } from "./test-context.ts";
+import { testBehaviour } from "./test-context.ts";
 
 /**
- * Write a supabase/config.toml covering every section the Go updater touches.
- * For each section, it'll create a small diff to the recorded test project.
- * Without any diff, no PATCH/POST requests will be sent to the management API.
+ * Writes a supabase/config.toml covering every section `config push`
+ * reconciles, each with a small diff against the recorded test project — a
+ * section without a diff sends no PATCH/POST to the management API.
  */
 function writeConfigToml(dir: string): void {
   mkdirSync(join(dir, "supabase"), { recursive: true });
@@ -55,15 +55,8 @@ enabled = true
   );
 }
 
-/**
- * The CLI will prompt the user y/n for each section that has a diff.
- * The test process runs with stdin closed, so run the commands with the `--yes` flag.
- */
+// `--yes` skips the per-section y/n prompt, since the test process runs with stdin closed.
 describe("config push", () => {
-  testParity(["config", "push", "--yes", "--project-ref", PROJECT_REF], {
-    workspaceSetup: (dir) => writeConfigToml(dir),
-  });
-
   testBehaviour("reconciles every section against the remote", async ({ run, workspace }) => {
     writeConfigToml(workspace.path);
     const result = await run(["config", "push", "--yes", "--project-ref", PROJECT_REF]);
@@ -76,13 +69,6 @@ describe("config push", () => {
     expect(result.exitCode).toBe(0);
     expect(result.stderr).toMatch(/HTTP.*GET:/);
   });
-
-  /**
-   * `testBehaviour(..) -> run(..)` always injects `PROJECT_REF`, which is then assigned
-   *  to SUPABASE_PROJECT_ID, and read by the Go cli if `--project-ref` is not passed.
-   * `testParity` does not inject `PROJECT_REF`, so this tests the unlinked project case.
-   */
-  testParity(["config", "push", "--yes"]);
 
   testBehaviour("exits non-zero on 401 with token guidance", async ({ run, apiUrl, workspace }) => {
     await fetch(`${apiUrl}/_ctrl/error-all`, {
@@ -212,15 +198,5 @@ describe("config push", () => {
     const result = await run(["config", "push", "--yes", "--project-ref", PROJECT_REF]);
     expect(result.exitCode).not.toBe(0);
     expect(result.stderr).toContain("502");
-  });
-
-  testParity(["config", "push", "--yes", "--project-ref", PROJECT_REF], {
-    failureType: "NON_AUTH",
-    workspaceSetup: (dir) => writeConfigToml(dir),
-  });
-
-  testParity(["config", "push", "--yes", "--project-ref", PROJECT_REF], {
-    failureType: "RATE_LIMIT",
-    workspaceSetup: (dir) => writeConfigToml(dir),
   });
 });

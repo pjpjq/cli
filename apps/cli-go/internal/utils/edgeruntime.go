@@ -13,6 +13,18 @@ import (
 	"github.com/spf13/viper"
 )
 
+// EdgeRuntimeScriptErrorSentinel is printed to stderr by the pg-delta Deno
+// templates when their body throws (see the `catch` blocks in
+// internal/db/diff/templates/*.ts). The templates force the edge-runtime worker
+// to exit by throwing on both the success and failure paths, and that non-zero
+// exit is otherwise suppressed here when stderr contains "main worker has been
+// destroyed". Without a distinct marker a crashed script would be
+// indistinguishable from a successful empty diff, so `db pull` would report "No
+// schema changes found" while the real error (e.g. a permission-denied catalog
+// query) was silently swallowed. Templates and tests must reference this exact
+// string. See supabase/cli#5826.
+const EdgeRuntimeScriptErrorSentinel = "PGDELTA_SCRIPT_ERROR"
+
 // edgeRuntimeFile is a single file dropped into the edge-runtime container's
 // working directory before the configured command is run.
 type edgeRuntimeFile struct {
@@ -94,7 +106,14 @@ func RunEdgeRuntimeScript(ctx context.Context, env []string, script string, bind
 	if len(state.extraEnv) > 0 {
 		combinedEnv = append(append([]string{}, env...), state.extraEnv...)
 	}
-	if err := DockerRunOnceWithConfig(
+	// Wait for the container to exit and then read its logs, rather than
+	// following the log stream to detect completion. The edge-runtime worker is
+	// forced to exit once the script flushes its output, but podman's
+	// /logs?follow endpoint does not close when the container stops, so a
+	// followed read (DockerRunOnceWithConfig) hangs the CLI forever
+	// (supabase/pg-toolbelt#312). pg-delta script output is bounded, so reading
+	// the log once after exit is safe.
+	if err := DockerRunOnceWaitWithConfig(
 		ctx,
 		container.Config{
 			Image:      Config.EdgeRuntime.Image,
@@ -111,6 +130,14 @@ func RunEdgeRuntimeScript(ctx context.Context, env []string, script string, bind
 		stderr,
 	); err != nil && !strings.Contains(stderr.String(), "main worker has been destroyed") {
 		return errors.Errorf("%s: %w:\n%s", errPrefix, err, stderr.String())
+	}
+	// The templates suppress their own non-zero exit (they throw to force the
+	// worker to exit, which surfaces as "main worker has been destroyed"), so a
+	// script crash can slip past the check above. Treat the sentinel — printed
+	// only by the templates' catch blocks — as a hard failure so the real error,
+	// collected in stderr, reaches the user instead of looking like an empty diff.
+	if strings.Contains(stderr.String(), EdgeRuntimeScriptErrorSentinel) {
+		return errors.Errorf("%s: error running script:\n%s", errPrefix, stderr.String())
 	}
 	return nil
 }

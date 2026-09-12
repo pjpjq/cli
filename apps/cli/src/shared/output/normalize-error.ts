@@ -1,4 +1,8 @@
 import { Cause, Option } from "effect";
+import { CliError } from "effect/unstable/cli";
+import { formatInvalidValueMessage } from "../cli/invalid-value-message.ts";
+import type { CliErrorSuggestionContext } from "../cli/subcommand-flag-suggestions.ts";
+import { formatCliErrorsForDisplay } from "../cli/subcommand-flag-suggestions.ts";
 
 type NormalizedCliError = {
   readonly code: string;
@@ -17,56 +21,26 @@ const readString = (value: ErrorRecord, key: string): string | undefined => {
   return typeof field === "string" && field.trim().length > 0 ? field.trim() : undefined;
 };
 
-const mappedError = (error: ErrorRecord): NormalizedCliError | undefined => {
+// Unlike `readString`, does not trim or reject empty strings: some fields
+// carry raw user input (e.g. `CliError.InvalidValue#value`) where an empty
+// string or meaningful whitespace is a legitimate value that must be
+// reported verbatim.
+const readRawString = (value: ErrorRecord, key: string): string | undefined => {
+  const field = value[key];
+  return typeof field === "string" ? field : undefined;
+};
+
+const mappedError = (
+  error: ErrorRecord,
+  context?: CliErrorSuggestionContext,
+): NormalizedCliError | undefined => {
   const tag = readString(error, "_tag");
   switch (tag) {
-    case "NoRunningStackError":
-      return {
-        code: tag,
-        message: "No local Supabase stack is running for this project.",
-        detail: "The CLI could not find a running stack for the current working directory.",
-        suggestion:
-          "Run `supabase start` in this project, or change into a directory with a running stack.",
-      };
-    case "StateNotFoundError": {
-      const name = readString(error, "name");
-      return {
-        code: tag,
-        message: "The requested local Supabase stack was not found.",
-        ...(name ? { detail: `Missing stack state: ${name}.` } : {}),
-        suggestion: "Run `supabase start` to create a new local stack.",
-      };
-    }
-    case "DaemonStillRunningError": {
-      const name = readString(error, "name");
-      return {
-        code: tag,
-        message: "The local Supabase stack did not stop cleanly.",
-        ...(name ? { detail: `Stack "${name}" is still running.` } : {}),
-        suggestion: "Wait a moment and try `supabase stop` again.",
-      };
-    }
-    case "StackAlreadyRunningError":
-      return {
-        code: tag,
-        message:
-          readString(error, "name") && typeof error.pid === "number"
-            ? `A Supabase stack "${readString(error, "name")}" is already running (PID ${error.pid}).`
-            : "A local Supabase stack is already running.",
-        suggestion: "Use `supabase stop` before starting another stack for this project.",
-      };
-    case "DaemonStartError":
-      return {
-        code: tag,
-        message: readString(error, "message") ?? "Failed to start the Supabase daemon.",
-        suggestion: "Check local resources and try `supabase start` again.",
-      };
     case "MissingOption": {
-      // Mirror Go Cobra's `required flag(s) "X" not set` wording. Effect CLI's
-      // default `Missing required flag: --X` differs and would break scripts
-      // that parse the Go CLI's stderr. We still cannot suppress Effect CLI's
-      // pre-error help dump (Cobra doesn't show it on parse error) — that
-      // would require a forked CLI parser. Match what we can.
+      // Matches the CLI's established `required flag(s) "X" not set` wording
+      // (not Effect CLI's default `Missing required flag: --X`) so scripts
+      // parsing stderr keep working. The pre-error help dump above it can't
+      // be suppressed without forking the parser.
       const option = readString(error, "option");
       return {
         code: tag,
@@ -75,19 +49,71 @@ const mappedError = (error: ErrorRecord): NormalizedCliError | undefined => {
           : "Error: required flag(s) not set",
       };
     }
+    case "InvalidValue": {
+      // A global-flag `InvalidValue` (`--output-format`, `--output`/`-o`,
+      // `--dns-resolver`, `--agent`) bypasses `CliOutput.Formatter` and lands
+      // here; apply the same doubled-"Expected"-prefix fix as the `ShowHelp` path.
+      const option = readString(error, "option");
+      // Raw read: `value` is the exact argv token typed by the user and may
+      // legitimately be `""` or carry whitespace; `readString` would trim or
+      // drop it, masking the bug this case exists to fix.
+      const value = readRawString(error, "value");
+      const expected = readString(error, "expected");
+      const kind = readString(error, "kind");
+      if (
+        option !== undefined &&
+        value !== undefined &&
+        expected !== undefined &&
+        (kind === "flag" || kind === "argument")
+      ) {
+        const message = formatInvalidValueMessage({ option, value, expected, kind });
+        if (message !== undefined) return { code: tag, message };
+      }
+      return undefined;
+    }
+    case "UnknownSubcommand":
+      return {
+        code: "UnknownSubcommand",
+        message: readString(error, "message") ?? "Unknown subcommand",
+      };
     case "ShowHelp": {
-      // Effect CLI wraps parse errors in a ShowHelp envelope (`CliError.ts`)
-      // whose `errors` array holds the underlying causes. If exactly one of
-      // those is a known recoverable type with a Go-parity mapping, unwrap
-      // and surface that instead of the generic "Help requested" envelope
-      // message — otherwise the user sees a useless top-line above the real
-      // problem.
+      // `ShowHelp` wraps parse errors; if exactly one inner error has a known
+      // mapping here, surface that instead of the generic "Help requested"
+      // envelope message.
       const errors = error["errors"];
-      if (Array.isArray(errors) && errors.length === 1) {
+      if (!Array.isArray(errors) || errors.length === 0) return undefined;
+
+      if (errors.length === 1) {
         const inner = errors[0];
         if (isErrorRecord(inner)) {
-          const innerMapped = mappedError(inner);
+          const innerMapped = mappedError(inner, context);
           if (innerMapped) return innerMapped;
+        }
+      }
+
+      // No known single-error mapping applies. Reuse
+      // `formatCliErrorsForDisplay` so subcommand-flag hints survive, rather
+      // than falling through to the generic "Help requested" envelope message.
+      if (errors.every(CliError.isCliError)) {
+        const formatted = formatCliErrorsForDisplay(errors, context);
+        if (formatted.errors.length > 0) {
+          const [only] = formatted.errors;
+          return {
+            code: formatted.errors.length === 1 && only ? only._tag : "ShowHelp",
+            message: formatted.errors.map((formattedError) => formattedError.message).join("\n\n"),
+          };
+        }
+      }
+
+      // Defensive fallback for an inner value with a usable `_tag`/`message`
+      // pair but not a real `CliError` instance (e.g. a hand-rolled test
+      // double); real `ShowHelp.errors` entries always are.
+      if (errors.length === 1) {
+        const inner = errors[0];
+        if (isErrorRecord(inner)) {
+          const code = readString(inner, "_tag");
+          const message = readString(inner, "message");
+          if (code && message) return { code, message };
         }
       }
       return undefined;
@@ -95,9 +121,12 @@ const mappedError = (error: ErrorRecord): NormalizedCliError | undefined => {
   }
 };
 
-export function normalizeCliError(error: unknown): NormalizedCliError {
+export function normalizeCliError(
+  error: unknown,
+  context?: CliErrorSuggestionContext,
+): NormalizedCliError {
   if (isErrorRecord(error)) {
-    const mapped = mappedError(error);
+    const mapped = mappedError(error, context);
     if (mapped) {
       return mapped;
     }
@@ -105,12 +134,15 @@ export function normalizeCliError(error: unknown): NormalizedCliError {
     const code = readString(error, "_tag") ?? "UnknownError";
     const message = readString(error, "message") ?? readString(error, "detail") ?? code;
     const detail = readString(error, "detail");
-    const suggestion = readString(error, "suggestion");
+    // Raw read: some producers' suggestion text carries meaningful leading
+    // whitespace (e.g. `suggestLegacyBundle`'s leading `\n` for a blank
+    // separator line); `readString` would trim exactly that away.
+    const suggestion = readRawString(error, "suggestion");
     return {
       code,
       message,
       ...(detail && detail !== message ? { detail } : {}),
-      ...(suggestion ? { suggestion } : {}),
+      ...(suggestion !== undefined && suggestion.length > 0 ? { suggestion } : {}),
     };
   }
 
@@ -134,9 +166,15 @@ export function normalizeCliError(error: unknown): NormalizedCliError {
   };
 }
 
-export function normalizeCause(cause: Cause.Cause<unknown>): NormalizedCliError {
+export function normalizeCause(
+  cause: Cause.Cause<unknown>,
+  context?: CliErrorSuggestionContext,
+): NormalizedCliError {
   const errorOption = Cause.findErrorOption(cause);
-  return normalizeCliError(Option.getOrElse(errorOption, () => Cause.squash(cause)));
+  return normalizeCliError(
+    Option.getOrElse(errorOption, () => Cause.squash(cause)),
+    context,
+  );
 }
 
 export function formatCliError(error: NormalizedCliError): string {

@@ -3,13 +3,17 @@ package function
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"io"
 	"mime/multipart"
 	"net/http"
 	"os"
 	"path"
+	"strings"
 	"testing"
 	fs "testing/fstest"
+	"time"
 
 	"github.com/h2non/gock"
 	"github.com/stretchr/testify/assert"
@@ -28,7 +32,24 @@ func assertFormEqual(t *testing.T, actual []byte) {
 	assert.Equal(t, string(expected), string(actual))
 }
 
-func mockFunctionList(functions ...api.FunctionResponse) {
+// captureBody records the request body without consuming it, so tests can assert
+// on the exact payload sent to a mocked endpoint.
+func captureBody(out *[]byte) gock.MatchFunc {
+	return func(req *http.Request, _ *gock.Request) (bool, error) {
+		if req.Body == nil {
+			return true, nil
+		}
+		body, err := io.ReadAll(req.Body)
+		if err != nil {
+			return false, err
+		}
+		req.Body = io.NopCloser(bytes.NewReader(body))
+		*out = body
+		return true, nil
+	}
+}
+
+func mockFunctionList(functions ...api.FunctionResponseOutput) {
 	gock.New(mockApiHost).
 		Get("/v1/projects/" + mockProject + "/functions").
 		Reply(http.StatusOK).
@@ -103,7 +124,7 @@ func TestDeployAll(t *testing.T) {
 			Post("/v1/projects/"+mockProject+"/functions/deploy").
 			MatchParam("slug", "demo").
 			Reply(http.StatusCreated).
-			JSON(api.DeployFunctionResponse{})
+			JSON(api.DeployFunctionResponseOutput{})
 		// Run test
 		err := client.Deploy(context.Background(), c, fsys)
 		// Check error
@@ -132,7 +153,7 @@ func TestDeployAll(t *testing.T) {
 			Post("/v1/projects/"+mockProject+"/functions/deploy").
 			MatchParam("slug", "demo").
 			Reply(http.StatusCreated).
-			JSON(api.DeployFunctionResponse{})
+			JSON(api.DeployFunctionResponseOutput{})
 		// Run test
 		err := client.Deploy(context.Background(), c, fsys)
 		// Check error
@@ -162,12 +183,12 @@ func TestDeployAll(t *testing.T) {
 				Post("/v1/projects/"+mockProject+"/functions/deploy").
 				MatchParam("slug", slug).
 				Reply(http.StatusCreated).
-				JSON(api.DeployFunctionResponse{Id: slug})
+				JSON(api.DeployFunctionResponseOutput{Id: slug})
 		}
 		gock.New(mockApiHost).
 			Put("/v1/projects/" + mockProject + "/functions").
 			Reply(http.StatusOK).
-			JSON(api.BulkUpdateFunctionResponse{})
+			JSON(api.BulkUpdateFunctionResponseOutput{})
 		// Run test
 		err := client.Deploy(context.Background(), c, fsys)
 		// Check error
@@ -197,7 +218,7 @@ func TestDeployAll(t *testing.T) {
 				Post("/v1/projects/"+mockProject+"/functions/deploy").
 				MatchParam("slug", slug).
 				Reply(http.StatusCreated).
-				JSON(api.DeployFunctionResponse{Id: slug})
+				JSON(api.DeployFunctionResponseOutput{Id: slug})
 		}
 		gock.New(mockApiHost).
 			Put("/v1/projects/"+mockProject+"/functions").
@@ -207,11 +228,171 @@ func TestDeployAll(t *testing.T) {
 		gock.New(mockApiHost).
 			Put("/v1/projects/" + mockProject + "/functions").
 			Reply(http.StatusOK).
-			JSON(api.BulkUpdateFunctionResponse{})
+			JSON(api.BulkUpdateFunctionResponseOutput{})
 		// Run test
 		err := client.Deploy(context.Background(), c, fsys)
 		// Check error
 		assert.NoError(t, err)
+		assert.Empty(t, gock.Pending())
+		assert.Empty(t, gock.GetUnmatchedRequests())
+	})
+
+	t.Run("bulk updates successful uploads when one fails", func(t *testing.T) {
+		c := config.FunctionConfig{
+			"test-ts": {
+				Enabled:    true,
+				Entrypoint: "testdata/shared/whatever.ts",
+			},
+			"test-js": {
+				Enabled:    true,
+				Entrypoint: "testdata/geometries/Geometries.js",
+			},
+		}
+		// Setup in-memory fs
+		fsys := testImports
+		// Setup mock api
+		defer gock.OffAll()
+		mockFunctionList()
+		gock.New(mockApiHost).
+			Post("/v1/projects/"+mockProject+"/functions/deploy").
+			MatchParam("slug", "test-ts").
+			Reply(http.StatusCreated).
+			JSON(api.DeployFunctionResponseOutput{Id: "test-ts", Name: "test-ts", Slug: "test-ts"})
+		gock.New(mockApiHost).
+			Post("/v1/projects/"+mockProject+"/functions/deploy").
+			MatchParam("slug", "test-js").
+			Reply(http.StatusConflict).
+			JSON(map[string]string{"message": "deployment already exists"})
+		var bulkBody []byte
+		gock.New(mockApiHost).
+			Put("/v1/projects/" + mockProject + "/functions").
+			AddMatcher(captureBody(&bulkBody)).
+			Reply(http.StatusOK).
+			JSON(api.BulkUpdateFunctionResponseOutput{})
+		// Run test
+		err := client.Deploy(context.Background(), c, fsys)
+		// Check error
+		assert.ErrorContains(t, err, "unexpected deploy status 409")
+		assert.Empty(t, gock.Pending())
+		assert.Empty(t, gock.GetUnmatchedRequests())
+		var toUpdate api.BulkUpdateFunctionBody
+		require.NoError(t, json.Unmarshal(bulkBody, &toUpdate))
+		require.Len(t, toUpdate, 1)
+		assert.Equal(t, "test-ts", toUpdate[0].Slug)
+	})
+
+	t.Run("skips bulk update when all uploads fail", func(t *testing.T) {
+		c := config.FunctionConfig{
+			"test-ts": {
+				Enabled:    true,
+				Entrypoint: "testdata/shared/whatever.ts",
+			},
+			"test-js": {
+				Enabled:    true,
+				Entrypoint: "testdata/geometries/Geometries.js",
+			},
+		}
+		// Setup in-memory fs
+		fsys := testImports
+		// Setup mock api
+		defer gock.OffAll()
+		mockFunctionList()
+		for slug := range c {
+			gock.New(mockApiHost).
+				Post("/v1/projects/"+mockProject+"/functions/deploy").
+				MatchParam("slug", slug).
+				Reply(http.StatusConflict).
+				JSON(map[string]string{"message": "deployment already exists"})
+		}
+		// Run test
+		err := client.Deploy(context.Background(), c, fsys)
+		// Check error
+		assert.ErrorContains(t, err, "unexpected deploy status 409")
+		// No bulk update is mocked, so any PUT would show up as unmatched
+		assert.Empty(t, gock.Pending())
+		assert.Empty(t, gock.GetUnmatchedRequests())
+	})
+
+	t.Run("reports upload and bulk update failures together", func(t *testing.T) {
+		c := config.FunctionConfig{
+			"test-ts": {
+				Enabled:    true,
+				Entrypoint: "testdata/shared/whatever.ts",
+			},
+			"test-js": {
+				Enabled:    true,
+				Entrypoint: "testdata/geometries/Geometries.js",
+			},
+		}
+		// Setup in-memory fs
+		fsys := testImports
+		// Setup mock api
+		defer gock.OffAll()
+		mockFunctionList()
+		gock.New(mockApiHost).
+			Post("/v1/projects/"+mockProject+"/functions/deploy").
+			MatchParam("slug", "test-ts").
+			Reply(http.StatusCreated).
+			JSON(api.DeployFunctionResponseOutput{Id: "test-ts", Name: "test-ts", Slug: "test-ts"})
+		gock.New(mockApiHost).
+			Post("/v1/projects/"+mockProject+"/functions/deploy").
+			MatchParam("slug", "test-js").
+			Reply(http.StatusConflict).
+			JSON(map[string]string{"message": "deployment already exists"})
+		gock.New(mockApiHost).
+			Put("/v1/projects/" + mockProject + "/functions").
+			Reply(http.StatusBadRequest).
+			JSON(map[string]string{"message": "bulk update rejected"})
+		// Run test
+		err := client.Deploy(context.Background(), c, fsys)
+		// Check error
+		assert.ErrorContains(t, err, "unexpected deploy status 409")
+		assert.ErrorContains(t, err, "unexpected bulk update status 400")
+		assert.Empty(t, gock.Pending())
+		assert.Empty(t, gock.GetUnmatchedRequests())
+	})
+
+	t.Run("reports concurrent upload failures in input order", func(t *testing.T) {
+		client2 := NewEdgeRuntimeAPI(mockProject, *apiClient, WithMaxJobs(2))
+		toDeploy := []FunctionDeployMetadata{
+			{
+				Name:           cast.Ptr("first-fn"),
+				EntrypointPath: "testdata/shared/whatever.ts",
+			},
+			{
+				Name:           cast.Ptr("second-fn"),
+				EntrypointPath: "testdata/geometries/Geometries.js",
+			},
+		}
+		fsys := testImports
+		// Setup mock api
+		defer gock.OffAll()
+		gock.New(mockApiHost).
+			Post("/v1/projects/"+mockProject+"/functions/deploy").
+			MatchParam("slug", "first-fn").
+			Reply(http.StatusConflict).
+			Delay(500 * time.Millisecond).
+			JSON(map[string]string{"message": "first failed"})
+		gock.New(mockApiHost).
+			Post("/v1/projects/"+mockProject+"/functions/deploy").
+			MatchParam("slug", "second-fn").
+			Reply(http.StatusConflict).
+			JSON(map[string]string{"message": "second failed"})
+		// Run test
+		err := client2.bulkUpload(context.Background(), toDeploy, fsys)
+		// Check error
+		require.Error(t, err)
+		// JSON replies are newline-terminated by json.Encoder, so filter out the
+		// resulting blank lines between joined errors before counting entries.
+		var lines []string
+		for _, line := range strings.Split(err.Error(), "\n") {
+			if len(line) > 0 {
+				lines = append(lines, line)
+			}
+		}
+		require.Len(t, lines, 2)
+		assert.Contains(t, lines[0], "first failed")
+		assert.Contains(t, lines[1], "second failed")
 		assert.Empty(t, gock.Pending())
 		assert.Empty(t, gock.GetUnmatchedRequests())
 	})
@@ -225,7 +406,7 @@ func TestDeployAll(t *testing.T) {
 		fsys := testImports
 		// Setup mock api
 		defer gock.OffAll()
-		mockFunctionList(api.FunctionResponse{
+		mockFunctionList(api.FunctionResponseOutput{
 			Id:        "demo",
 			Name:      "demo",
 			Slug:      "demo",
@@ -236,7 +417,7 @@ func TestDeployAll(t *testing.T) {
 			MatchParam("slug", "demo").
 			BodyString(`"verify_jwt":false`).
 			Reply(http.StatusCreated).
-			JSON(api.DeployFunctionResponse{})
+			JSON(api.DeployFunctionResponseOutput{})
 		// Run test
 		err := client.Deploy(context.Background(), c, fsys)
 		// Check error

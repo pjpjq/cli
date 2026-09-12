@@ -3,46 +3,89 @@ import { makeApiClient, type ApiClient } from "@supabase/api/effect";
 import { Data, Duration, Effect, Exit, Redacted } from "effect";
 import * as HttpClient from "effect/unstable/http/HttpClient";
 import * as HttpClientRequest from "effect/unstable/http/HttpClientRequest";
-import { renderGlamourTable } from "../../legacy/output/legacy-glamour-table.ts";
+import { renderGlamourTable } from "../../output/glamour-table.ts";
+import {
+  actionability,
+  type CliErrorActionabilityDeclaration,
+  ErrorActionabilityId,
+} from "../telemetry/error-actionability.ts";
 import {
   dockerfileServiceImages,
   parseDockerfileServiceImages,
   type DockerfileImageSpec,
 } from "./dockerfile-images.ts";
+import { slimImageForAlias, slimImageForCurrentPin, slimImagesEnabled } from "./slim-images.ts";
 
 export { parseDockerfileServiceImages } from "./dockerfile-images.ts";
 
 export type RemoteServiceName = "postgres" | "auth" | "postgrest" | "storage";
 export type OptionalRemoteServiceName = Exclude<RemoteServiceName, "postgres">;
+export type LocalServiceVersionName =
+  | "postgres"
+  | "auth"
+  | "postgrest"
+  | "realtime"
+  | "storage"
+  | "edge-runtime"
+  | "studio"
+  | "pgmeta"
+  | "analytics"
+  | "pooler";
 
-// Mirrors Go's `utils.ProjectRefPattern` (`apps/cli-go/internal/utils/misc.go`).
-// Validating the ref before it reaches the management API path param or the
-// tenant gateway hostname keeps a tampered/malformed value from redirecting the
-// service-role key to an attacker-controlled host.
+export type LocalServiceVersionOverrides = Partial<Record<LocalServiceVersionName, string>>;
+export type LocalServiceImageOverrides = Partial<Record<LocalServiceVersionName, string>>;
+
+export interface LocalServiceImageOptions {
+  readonly imageOverrides?: LocalServiceImageOverrides;
+  readonly normalizeVersionTags?: boolean;
+  readonly serviceVersions?: LocalServiceVersionOverrides;
+  /**
+   * Legacy `.temp` pins only slim-translate when they match the current
+   * Dockerfile tag (unpublished historical slim tags). Next start runs
+   * catalog versions from GHCR, so it leaves this off.
+   */
+  readonly slimCurrentPinOnly?: boolean;
+}
+
+// Validates the ref before it reaches the management API path param or the tenant gateway
+// hostname, so a tampered/malformed value can't redirect the service-role key to an
+// attacker-controlled host.
 const PROJECT_REF_PATTERN = /^[a-z]{20}$/;
 
 interface ServiceImageSpec {
+  readonly alias: string;
   readonly image: string;
   readonly remoteService: RemoteServiceName | undefined;
+  readonly localService: LocalServiceVersionName;
 }
 
 interface ServiceImageAliasSpec {
   readonly alias: string;
   readonly remoteService: RemoteServiceName | undefined;
+  readonly localService: LocalServiceVersionName;
 }
 
 const SERVICE_IMAGE_ALIASES: ReadonlyArray<ServiceImageAliasSpec> = [
-  { alias: "pg", remoteService: "postgres" },
-  { alias: "gotrue", remoteService: "auth" },
-  { alias: "postgrest", remoteService: "postgrest" },
-  { alias: "realtime", remoteService: undefined },
-  { alias: "storage", remoteService: "storage" },
-  { alias: "edgeruntime", remoteService: undefined },
-  { alias: "studio", remoteService: undefined },
-  { alias: "pgmeta", remoteService: undefined },
-  { alias: "logflare", remoteService: undefined },
-  { alias: "supavisor", remoteService: undefined },
+  { alias: "pg", remoteService: "postgres", localService: "postgres" },
+  { alias: "gotrue", remoteService: "auth", localService: "auth" },
+  { alias: "postgrest", remoteService: "postgrest", localService: "postgrest" },
+  { alias: "realtime", remoteService: undefined, localService: "realtime" },
+  { alias: "storage", remoteService: "storage", localService: "storage" },
+  { alias: "edgeruntime", remoteService: undefined, localService: "edge-runtime" },
+  { alias: "studio", remoteService: undefined, localService: "studio" },
+  { alias: "pgmeta", remoteService: undefined, localService: "pgmeta" },
+  { alias: "logflare", remoteService: undefined, localService: "analytics" },
+  { alias: "supavisor", remoteService: undefined, localService: "pooler" },
 ];
+
+const SERVICE_VERSION_TAG_PREFIX: Partial<Record<LocalServiceVersionName, string>> = {
+  auth: "v",
+  postgrest: "v",
+  realtime: "v",
+  storage: "v",
+  "edge-runtime": "v",
+  pgmeta: "v",
+};
 
 function localServiceImagesFromSpecs(
   specs: ReadonlyArray<DockerfileImageSpec>,
@@ -55,8 +98,10 @@ function localServiceImagesFromSpecs(
     }
 
     return {
+      alias: service.alias,
       image,
       remoteService: service.remoteService,
+      localService: service.localService,
     };
   });
 }
@@ -68,6 +113,72 @@ export function localServiceImagesFromDockerfile(
 }
 
 const LOCAL_SERVICE_IMAGES = localServiceImagesFromSpecs(dockerfileServiceImages);
+
+export const POSTGRES_FALLBACK_IMAGE_PG14 = "supabase/postgres:14.1.0.89";
+/** Flag-off PG13/15 docker.io pin. */
+export const POSTGRES_FALLBACK_IMAGE_PG15 = "supabase/postgres:15.8.1.085";
+/** Published slim PG15 pin; flag-on majors 13/15 slim-translate this, not 15.8. */
+export const POSTGRES_FALLBACK_IMAGE_PG15_SLIM = "supabase/postgres:15.14.1.167";
+
+export function postgresImageForDbMajorVersion(majorVersion: number): string | undefined {
+  switch (majorVersion) {
+    case 13:
+    case 15:
+      return slimImagesEnabled() ? POSTGRES_FALLBACK_IMAGE_PG15_SLIM : POSTGRES_FALLBACK_IMAGE_PG15;
+    case 14:
+      return POSTGRES_FALLBACK_IMAGE_PG14;
+    default:
+      return undefined;
+  }
+}
+
+function replaceImageTag(image: string, tag: string): string {
+  const index = image.lastIndexOf(":");
+  if (index === -1) {
+    return image;
+  }
+  return `${image.slice(0, index + 1)}${tag.trim()}`;
+}
+
+function tagForServiceVersion(service: LocalServiceVersionName, version: string): string {
+  const trimmed = version.trim();
+  const prefix = SERVICE_VERSION_TAG_PREFIX[service];
+  if (prefix === "v" && !trimmed.toLowerCase().startsWith("v")) {
+    return `v${trimmed}`;
+  }
+  return trimmed;
+}
+
+function localServiceImagesForOptions(
+  options: LocalServiceImageOptions = {},
+): ReadonlyArray<ServiceImageSpec> {
+  const normalizeVersionTags = options.normalizeVersionTags ?? true;
+  const slim = slimImagesEnabled();
+  return LOCAL_SERVICE_IMAGES.map((service) => {
+    // Explicit overrides are used verbatim; the caller decides slim vs docker.io.
+    const override = options.imageOverrides?.[service.localService];
+    const baseImage = override ?? slimImageForAlias(service.alias, service.image);
+    const version = options.serviceVersions?.[service.localService];
+    if (version === undefined || version.trim().length === 0) {
+      return baseImage === service.image ? service : { ...service, image: baseImage };
+    }
+    const pin = normalizeVersionTags
+      ? tagForServiceVersion(service.localService, version)
+      : version;
+    if (override === undefined && slim) {
+      return {
+        ...service,
+        image: options.slimCurrentPinOnly
+          ? slimImageForCurrentPin(service.alias, service.image, pin)
+          : slimImageForAlias(service.alias, replaceImageTag(service.image, pin)),
+      };
+    }
+    return {
+      ...service,
+      image: replaceImageTag(baseImage, pin),
+    };
+  });
+}
 
 const TABLE_HEADERS = ["SERVICE IMAGE", "LOCAL", "LINKED"] as const;
 
@@ -114,9 +225,14 @@ export interface ServiceFetchConfig {
   readonly tenantBaseUrlOverride?: string;
 }
 
+/** @public */
 class ServiceVersionNotFoundError extends Data.TaggedError("ServiceVersionNotFoundError")<{
   readonly service: string;
-}> {}
+}> {
+  get [ErrorActionabilityId](): CliErrorActionabilityDeclaration {
+    return actionability.provideFlags;
+  }
+}
 
 function fieldValue(value: unknown, key: string): unknown {
   if (typeof value !== "object" || value === null) {
@@ -187,9 +303,8 @@ function hasProjectAccessKey<T extends ProjectApiKey>(keys: ReadonlyArray<T>): b
 const authenticatedRequest = (url: string, accessKey: Redacted.Redacted<string>) => {
   const key = Redacted.value(accessKey);
   const request = HttpClientRequest.get(url).pipe(HttpClientRequest.setHeader("apikey", key));
-  // New-style `sb_…` keys authenticate via the `apikey` header alone; older JWT
-  // keys additionally require a bearer token. Mirrors the conditional auth in
-  // `apps/cli-go/pkg/fetcher/gateway.go` and `legacy/shared/legacy-tenant-versions.ts`.
+  // New-style `sb_…` keys authenticate via the `apikey` header alone; older JWT keys also
+  // need a bearer token.
   return key.startsWith("sb_")
     ? request
     : request.pipe(HttpClientRequest.setHeader("Authorization", `Bearer ${key}`));
@@ -288,14 +403,19 @@ const makeConfiguredApiClient = Effect.fnUntraced(function* (input: ServiceFetch
   );
 });
 
-export function listLocalServiceVersions(): ReadonlyArray<ServiceVersionRow> {
-  return LOCAL_SERVICE_IMAGES.map((service) => toServiceVersionRow(service));
+export function listLocalServiceVersions(
+  options: LocalServiceImageOptions = {},
+): ReadonlyArray<ServiceVersionRow> {
+  return localServiceImagesForOptions(options).map((service) => toServiceVersionRow(service));
 }
 
 export function mergeRemoteServiceVersions(
   remote: Partial<Record<RemoteServiceName, string>>,
+  options: LocalServiceImageOptions = {},
 ): ReadonlyArray<ServiceVersionRow> {
-  return LOCAL_SERVICE_IMAGES.map((service) => toServiceVersionRow(service, remote));
+  return localServiceImagesForOptions(options).map((service) =>
+    toServiceVersionRow(service, remote),
+  );
 }
 
 export function renderServicesTable(rows: ReadonlyArray<ServiceVersionRow>): string {
@@ -319,9 +439,8 @@ export function renderServicesWarning(rows: ReadonlyArray<ServiceVersionRow>): s
 }
 
 /**
- * Renders the linked-version mismatch warning for stderr. In text mode the
- * `WARNING:` prefix is colorized (matching Go's `utils.Yellow`); machine modes
- * keep it plain so the stderr line stays parseable.
+ * Renders the linked-version mismatch warning for stderr. The `WARNING:` prefix is colorized
+ * in text mode; machine modes keep it plain so the stderr line stays parseable.
  */
 export function formatServicesWarning(message: string, textMode: boolean): string {
   const lines = message.split("\n");
@@ -330,16 +449,11 @@ export function formatServicesWarning(message: string, textMode: boolean): strin
   return `${prefix} ${first}\n${rest.join("\n")}\n`;
 }
 
-export function encodeLegacyTomlRows(rows: ReadonlyArray<ServiceVersionRow>) {
-  return { services: rows } as const;
-}
-
 export function fetchLinkedServiceVersions(input: ServiceFetchConfig) {
   return Effect.gen(function* () {
     const exit = yield* Effect.gen(function* () {
-      // Reject malformed refs before they reach the management API path param or
-      // the tenant gateway hostname (`https://<ref>.<host>`). The override is
-      // test-only, so it bypasses the check.
+      // Malformed refs are rejected before reaching the management API path param or the
+      // tenant gateway hostname; the test-only override bypasses this check.
       if (
         input.tenantBaseUrlOverride === undefined &&
         !PROJECT_REF_PATTERN.test(input.projectRef)

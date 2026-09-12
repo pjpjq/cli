@@ -1,26 +1,22 @@
 import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
-import { DEFAULT_VERSIONS } from "@supabase/stack/effect";
 import {
-  noteStackProjectHome,
+  noteStackCliProjectHome,
   registerTempHome,
   registerTempStackProject,
 } from "./stack-e2e-cleanup.ts";
 
+export { stripAnsi } from "./ansi.ts";
+
 const BINARY_EXT = process.platform === "win32" ? ".exe" : "";
 const SHIM_PATH = fileURLToPath(new URL("../../dist/supabase.js", import.meta.url));
-const LEGACY_BINARY_PATH = fileURLToPath(
-  new URL(`../../dist/supabase-legacy${BINARY_EXT}`, import.meta.url),
-);
-const NEXT_BINARY_PATH = fileURLToPath(
-  new URL(`../../dist/supabase-next${BINARY_EXT}`, import.meta.url),
-);
+const BINARY_PATH = fileURLToPath(new URL(`../../dist/supabase${BINARY_EXT}`, import.meta.url));
 
 // E2E subprocesses should only enter agent output mode when a test explicitly
 // opts in via `options.env`. Keep this list aligned with @vercel/detect-agent
@@ -52,13 +48,16 @@ function subprocessBaseEnv(): Record<string, string> {
     if (value !== undefined) env[key] = value;
   }
   for (const key of AGENT_DETECTION_ENV_KEYS) delete env[key];
+  // Keep test spawns hermetic: never let the upgrade notice hit GitHub or
+  // print into asserted output. Tests exercising the notice override this.
+  env["SUPABASE_NO_UPDATE_NOTIFIER"] = "1";
   return env;
 }
 
-function assertBuildArtifactsExist(shell: "legacy" | "next", binaryPath: string): void {
+function assertBuildArtifactsExist(binaryPath: string): void {
   if (!existsSync(SHIM_PATH) || !existsSync(binaryPath)) {
     throw new Error(
-      `Missing ${shell} CLI build artifacts. Run \`pnpm --filter supabase build\` before invoking ${shell} e2e tests.\n` +
+      `Missing CLI build artifacts. Run \`pnpm --filter supabase build\` before invoking e2e tests.\n` +
         `  expected shim:   ${SHIM_PATH}\n` +
         `  expected binary: ${binaryPath}`,
     );
@@ -69,9 +68,12 @@ type RunResult = {
   stdout: string;
   stderr: string;
   exitCode: number;
+  /** Set when the harness exit bound fired and SIGKILLed the process group. */
+  timedOutAfterMs?: number;
 };
 
 const DEFAULT_EXIT_TIMEOUT_MS = 60_000;
+const DEFAULT_STACK_CLEANUP_TIMEOUT_MS = 120_000;
 const OUTPUT_TAIL_LENGTH = 4_000;
 
 interface SpawnedSupabase {
@@ -80,7 +82,7 @@ interface SpawnedSupabase {
   readonly stdout: () => string;
   readonly stderr: () => string;
   readonly kill: (signal?: NodeJS.Signals) => void;
-  readonly waitForOutput: (pattern: RegExp, timeoutMs?: number) => Promise<void>;
+  readonly waitForOutput: (pattern: RegExp, timeoutMs?: number, startAt?: number) => Promise<void>;
   readonly waitForExit: (timeoutMs?: number) => Promise<RunResult>;
 }
 
@@ -126,6 +128,33 @@ function pickFreePort(): Promise<number> {
   });
 }
 
+/**
+ * Rewrites every active port assignment in an `init`-generated
+ * `supabase/config.toml` with a freshly allocated free port, so stacks started
+ * from default configs cannot collide on host ports with other e2e stacks on
+ * the same runner. Commented-out port lines are left untouched.
+ */
+export async function overrideStackPorts(projectDir: string) {
+  const configPath = path.join(projectDir, "supabase", "config.toml");
+  const config = await readFile(configPath, "utf8");
+  const assigned = new Set<number>();
+  const lines: string[] = [];
+  for (const line of config.split("\n")) {
+    const match = /^(\s*(?:port|smtp_port|pop3_port|inspector_port|shadow_port) = )\d+$/.exec(line);
+    if (match === null) {
+      lines.push(line);
+      continue;
+    }
+    let port = await pickFreePort();
+    while (assigned.has(port)) {
+      port = await pickFreePort();
+    }
+    assigned.add(port);
+    lines.push(`${match[1]}${port}`);
+  }
+  await writeFile(configPath, lines.join("\n"));
+}
+
 async function makeTempProject(prefix = "supabase-project-e2e-") {
   const projectDir = await mkdtemp(path.join(tmpdir(), prefix));
 
@@ -135,6 +164,50 @@ async function makeTempProject(prefix = "supabase-project-e2e-") {
       await rm(projectDir, { recursive: true, force: true });
     },
   };
+}
+
+/** Create an isolated CLI project without pre-allocating released ports. */
+export async function makeTempCliProject(prefix = "supabase-cli-e2e-") {
+  const project = await makeTempProject(prefix);
+  registerTempStackProject(project);
+  return project;
+}
+
+export async function makeTempCliStackProject(
+  prefix = "supabase-stack-e2e-",
+  cleanupTimeoutMs = DEFAULT_STACK_CLEANUP_TIMEOUT_MS,
+) {
+  const project = await makeTempProject(prefix);
+  const cleanup = async () => {
+    if (!existsSync(project.dir)) return;
+
+    // `init` can fail before creating a project config. There is no stack to
+    // stop in that case, so remove the exact owned directory directly.
+    if (!existsSync(path.join(project.dir, "supabase", "config.toml"))) {
+      await rm(project.dir, { recursive: true, force: true });
+      return;
+    }
+
+    const stopped = await runSupabase(["stop", "--no-backup"], {
+      cwd: project.dir,
+      exitTimeoutMs: cleanupTimeoutMs,
+    });
+    if (stopped.exitCode !== 0) {
+      throw new Error(
+        [
+          `Failed to stop stack in ${project.dir} (exit code ${stopped.exitCode}).`,
+          `stdout:\n${stopped.stdout}`,
+          `stderr:\n${stopped.stderr}`,
+        ].join("\n"),
+      );
+    }
+
+    await rm(project.dir, { recursive: true, force: true });
+  };
+
+  const stackProject = { dir: project.dir, cleanup };
+  registerTempStackProject(stackProject);
+  return stackProject;
 }
 
 export async function makeTempStackProject(prefix = "supabase-stack-e2e-") {
@@ -160,20 +233,37 @@ export async function makeTempStackProject(prefix = "supabase-stack-e2e-") {
     poolerApiPort: await pickFreePort(),
   };
 
-  const stackDir = path.join(project.dir, ".supabase", "stacks", "default");
-  await mkdir(stackDir, { recursive: true });
+  const supabaseDir = path.join(project.dir, "supabase");
+  await mkdir(supabaseDir, { recursive: true });
   await writeFile(
-    path.join(stackDir, "stack.json"),
-    `${JSON.stringify(
-      {
-        schemaVersion: 1,
-        updatedAt: new Date().toISOString(),
-        ports,
-        services: DEFAULT_VERSIONS,
-      },
-      null,
-      2,
-    )}\n`,
+    path.join(supabaseDir, "config.toml"),
+    [
+      'project_id = "e2e"',
+      "",
+      "[api]",
+      `port = ${ports.apiPort}`,
+      "",
+      "[db]",
+      `port = ${ports.dbPort}`,
+      "",
+      "[db.pooler]",
+      `port = ${ports.poolerPort}`,
+      "",
+      "[edge_runtime]",
+      `inspector_port = ${ports.edgeRuntimeInspectorPort}`,
+      "",
+      "[local_smtp]",
+      `port = ${ports.mailpitPort}`,
+      `smtp_port = ${ports.mailpitSmtpPort}`,
+      `pop3_port = ${ports.mailpitPop3Port}`,
+      "",
+      "[studio]",
+      `port = ${ports.studioPort}`,
+      "",
+      "[analytics]",
+      `port = ${ports.analyticsPort}`,
+      "",
+    ].join("\n"),
   );
 
   const stackProject = {
@@ -205,7 +295,8 @@ export function spawnSupabase(
   args: string[],
   options?: {
     cwd?: string;
-    env?: Record<string, string>;
+    /** `undefined` REMOVES the key from the child env (base env and pins included). */
+    env?: Record<string, string | undefined>;
     /** Reuse a temp SUPABASE_HOME directory instead of creating a new one per call. */
     home?: string;
     /** Write this string to stdin, then close it. */
@@ -214,34 +305,36 @@ export function spawnSupabase(
     cleanupProcessGroupOnClose?: boolean;
     /** Maximum time to wait for the process to exit before force-killing it. */
     exitTimeoutMs?: number;
-    /** Which source entrypoint to execute. */
-    entrypoint?: "next" | "legacy";
   },
 ): SpawnedSupabase {
   const ownHome = options?.home ? null : makeTempHome();
   const homeDir = options?.home ?? ownHome!.dir;
-  noteStackProjectHome(options?.cwd, homeDir);
-  const entrypoint = options?.entrypoint ?? "next";
+  noteStackCliProjectHome(options?.cwd, homeDir);
   const usesStartWrapper = args[0] === "start";
   // Exercise the same shim + compiled shell binary handoff that published
   // packages use. `SUPABASE_CLI_BINARY_OVERRIDE` points the shim at the local
   // build artifact without needing platform wrapper packages.
   let execCmd: string;
   let execArgs: string[];
-  const env: Record<string, string> = {
+  // An `undefined` in `options.env` removes the key entirely — pins and ambient values alike —
+  // so a cache-subject test can run with a variable genuinely absent (the shipped default),
+  // not just overridden.
+  const mergedEnv: Record<string, string | undefined> = {
     ...subprocessBaseEnv(),
     SUPABASE_HOME: homeDir,
     SUPABASE_NO_KEYRING: "1",
     SUPABASE_TELEMETRY_DISABLED: "1",
+    // Isolate e2e from the default-ON shadow cache. Cache-subject tests opt back in (or unset
+    // the key with `undefined`) via `options.env`.
+    SUPABASE_SHADOW_CACHE: "0",
     ...options?.env,
   };
-  if (entrypoint === "legacy") {
-    assertBuildArtifactsExist("legacy", LEGACY_BINARY_PATH);
-    env["SUPABASE_CLI_BINARY_OVERRIDE"] = LEGACY_BINARY_PATH;
-  } else {
-    assertBuildArtifactsExist("next", NEXT_BINARY_PATH);
-    env["SUPABASE_CLI_BINARY_OVERRIDE"] = NEXT_BINARY_PATH;
+  const env: Record<string, string> = {};
+  for (const [key, value] of Object.entries(mergedEnv)) {
+    if (value !== undefined) env[key] = value;
   }
+  assertBuildArtifactsExist(BINARY_PATH);
+  env["SUPABASE_CLI_BINARY_OVERRIDE"] = BINARY_PATH;
   execCmd = "node";
   execArgs = [SHIM_PATH, ...args];
   const proc = spawn(execCmd, execArgs, {
@@ -300,10 +393,33 @@ export function spawnSupabase(
     closeWaiters.clear();
   });
 
+  let stdinError: unknown;
   if (options?.stdin !== undefined && proc.stdin) {
+    proc.stdin.on("error", (error) => {
+      if (!("code" in error && error.code === "EPIPE")) {
+        stdinError = error;
+      }
+    });
     proc.stdin.write(options.stdin);
     proc.stdin.end();
   }
+
+  const stdinFailure = (result: RunResult) =>
+    new Error(
+      [
+        `stdin write to the CLI failed`,
+        `Command: supabase ${args.join(" ")}`,
+        `PID: ${proc.pid ?? "<unknown>"}`,
+        `exit code: ${result.exitCode}${
+          result.timedOutAfterMs === undefined
+            ? ""
+            : ` (no exit within ${result.timedOutAfterMs}ms, SIGKILLed by the harness)`
+        }`,
+        outputTail("stdout tail", result.stdout),
+        outputTail("stderr tail", result.stderr),
+      ].join("\n\n"),
+      { cause: stdinError },
+    );
 
   const waitForExit = async (
     timeoutMs = options?.exitTimeoutMs ?? DEFAULT_EXIT_TIMEOUT_MS,
@@ -311,11 +427,16 @@ export function spawnSupabase(
     if (closeResult) {
       cleanupProcessGroupOnClose();
       disposeOwnHome();
+      if (stdinError !== undefined) {
+        throw stdinFailure(closeResult);
+      }
       return closeResult;
     }
 
+    let timedOut = false;
     const result = await new Promise<RunResult>((resolve) => {
       const timeout = setTimeout(() => {
+        timedOut = true;
         killProcessGroup(proc.pid!, "SIGKILL");
         try {
           proc.kill("SIGKILL");
@@ -334,7 +455,10 @@ export function spawnSupabase(
     });
 
     disposeOwnHome();
-    return result;
+    if (stdinError !== undefined) {
+      throw stdinFailure(timedOut ? { ...result, timedOutAfterMs: timeoutMs } : result);
+    }
+    return timedOut ? { ...result, timedOutAfterMs: timeoutMs } : result;
   };
 
   return {
@@ -348,8 +472,9 @@ export function spawnSupabase(
         proc.kill(signal);
       } catch {}
     },
-    waitForOutput: async (pattern: RegExp, timeoutMs = 60_000) => {
-      if (pattern.test(stdout)) {
+    waitForOutput: async (pattern: RegExp, timeoutMs = 60_000, startAt = 0) => {
+      pattern.lastIndex = 0;
+      if (pattern.test(stdout.slice(startAt))) {
         return;
       }
       if (closeResult) {
@@ -381,7 +506,8 @@ export function spawnSupabase(
         }, timeoutMs);
 
         const onStdout = (_data: Buffer) => {
-          if (pattern.test(stdout)) {
+          pattern.lastIndex = 0;
+          if (pattern.test(stdout.slice(startAt))) {
             cleanup();
             resolve();
           }
@@ -420,7 +546,8 @@ export async function runSupabase(
   args: string[],
   options?: {
     cwd?: string;
-    env?: Record<string, string>;
+    /** `undefined` REMOVES the key from the child env (base env and pins included). */
+    env?: Record<string, string | undefined>;
     /** Reuse a temp SUPABASE_HOME directory instead of creating a new one per call. */
     home?: string;
     /** Write this string to stdin, then close it. */
@@ -431,8 +558,6 @@ export async function runSupabase(
     untilTimeoutMs?: number;
     /** Maximum time to wait for the command to exit before force-killing it. */
     exitTimeoutMs?: number;
-    /** Which source entrypoint to execute. */
-    entrypoint?: "next" | "legacy";
   },
 ): Promise<RunResult> {
   const spawned = spawnSupabase(args, options);
@@ -451,4 +576,24 @@ export async function runSupabase(
 
   const result = await spawned.waitForExit();
   return { ...result, exitCode: killedByUntil ? 0 : result.exitCode };
+}
+
+export function requireCliSuccess(
+  result: {
+    readonly exitCode: number;
+    readonly stdout: string;
+    readonly stderr: string;
+    readonly timedOutAfterMs?: number;
+  },
+  command: string,
+): void {
+  if (result.exitCode !== 0) {
+    const reason =
+      result.timedOutAfterMs === undefined
+        ? `exit ${result.exitCode}`
+        : `exit ${result.exitCode}; harness SIGKILLed it after ${result.timedOutAfterMs}ms without exit`;
+    throw new Error(
+      `${command} failed (${reason})\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
+    );
+  }
 }

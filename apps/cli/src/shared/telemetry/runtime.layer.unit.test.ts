@@ -4,11 +4,11 @@ import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { Effect, Layer } from "effect";
-import { cliConfigLayer } from "../../next/config/cli-config.layer.ts";
+import { cliSettingsLayer } from "../config/cli-settings.layer.ts";
 import { TelemetryRuntime } from "./runtime.service.ts";
 import { telemetryRuntimeLayer } from "./runtime.layer.ts";
 import {
-  mockProjectContext,
+  mockCliProjectContext,
   mockRuntimeInfo,
   mockTty,
   processEnvLayer,
@@ -24,15 +24,15 @@ function buildLayer(opts: {
   stdoutIsTty?: boolean;
 }): Layer.Layer<TelemetryRuntime> {
   const runtimeInfoLayer = mockRuntimeInfo({ homeDir: opts.homeDir });
-  const projectContextLayer = mockProjectContext();
+  const cliProjectContextLayer = mockCliProjectContext();
   const envLayer = processEnvLayer({
     SUPABASE_HOME: opts.homeDir,
     ...opts.env,
   });
   const ttyLayer = mockTty({ stdoutIsTty: opts.stdoutIsTty ?? false });
-  const configLayer = cliConfigLayer.pipe(
+  const configLayer = cliSettingsLayer.pipe(
     Layer.provide(runtimeInfoLayer),
-    Layer.provide(projectContextLayer),
+    Layer.provide(cliProjectContextLayer),
   );
   const telemetryLayer = telemetryRuntimeLayer.pipe(
     Layer.provide(configLayer),
@@ -135,6 +135,49 @@ describe("telemetryRuntimeLayer", () => {
       expect(existsSync(configPath)).toBe(true);
     }).pipe(
       Effect.provide(buildLayer({ homeDir, stdoutIsTty: true })),
+      Effect.ensuring(Effect.sync(() => rmSync(homeDir, { recursive: true, force: true }))),
+    );
+  });
+
+  // `consent` is read from disk once at layer-construction time and does not reflect a later
+  // on-disk write, so a command that rewrites telemetry.json mid-run doesn't retroactively
+  // change what that invocation already captured.
+  it.live("captures consent once; a later on-disk write does not change it", () => {
+    const homeDir = makeTempDir();
+    const configPath = path.join(homeDir, "telemetry.json");
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        enabled: true,
+        device_id: "device-123",
+        session_id: "session-123",
+        session_last_active: "2026-04-01T12:00:00Z",
+        schema_version: 1,
+      }),
+    );
+
+    return Effect.gen(function* () {
+      const runtime = yield* TelemetryRuntime;
+      expect(runtime.consent).toBe("granted");
+
+      // Simulates `disable` rewriting telemetry.json mid-command, after this layer already
+      // resolved `consent`.
+      yield* Effect.sync(() =>
+        writeFileSync(
+          configPath,
+          JSON.stringify({
+            enabled: false,
+            device_id: "device-123",
+            session_id: "session-123",
+            session_last_active: "2026-04-01T12:00:00Z",
+            schema_version: 1,
+          }),
+        ),
+      );
+
+      expect(runtime.consent).toBe("granted");
+    }).pipe(
+      Effect.provide(buildLayer({ homeDir })),
       Effect.ensuring(Effect.sync(() => rmSync(homeDir, { recursive: true, force: true }))),
     );
   });

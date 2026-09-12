@@ -1,4 +1,9 @@
-import { operationDefinitions, type ApiClient } from "@supabase/api/effect";
+import {
+  markSupabaseApiInputErrorAsUserInput,
+  operationDefinitions,
+  SupabaseApiInputError,
+  type ApiClient,
+} from "@supabase/api/effect";
 import { Effect, type Option } from "effect";
 import * as HttpClientError from "effect/unstable/http/HttpClientError";
 import { Output } from "../output/output.service.ts";
@@ -20,6 +25,12 @@ export interface DeleteFunctionDependencies<ResolveError, ResolveRequirements> {
   readonly resolveProjectRef: (
     projectRef: Option.Option<string>,
   ) => Effect.Effect<string, ResolveError, ResolveRequirements>;
+  /**
+   * Optional shell-specific styling for the slug/ref in the success line. Defaults to identity
+   * (plain text); keeping the hook injected keeps this shared module free of CLI-specific
+   * rendering.
+   */
+  readonly styleIdentifier?: (text: string) => string;
 }
 
 function validateSlug(slug: string): Effect.Effect<void, InvalidFunctionSlugError> {
@@ -47,6 +58,11 @@ export function deleteFunction<ResolveError, ResolveRequirements>(
       })
       .pipe(
         Effect.mapError((error) => {
+          if (error instanceof SupabaseApiInputError) {
+            // This operation's complete input is the resolved ref and the
+            // prevalidated slug, so a schema rejection is user-derived.
+            return markSupabaseApiInputErrorAsUserInput(error);
+          }
           if (HttpClientError.isHttpClientError(error)) {
             const description = error.reason.description ?? error.reason._tag;
             return new DeleteFunctionNetworkError({
@@ -72,6 +88,7 @@ export function deleteFunction<ResolveError, ResolveRequirements>(
         const body = yield* response.text.pipe(Effect.orElseSucceed(() => ""));
         return yield* Effect.fail(
           new DeleteFunctionUnexpectedStatusError({
+            status: response.status,
             message: `unexpected delete function status ${response.status}: ${body}`,
           }),
         );
@@ -86,6 +103,7 @@ export function deleteFunction<ResolveError, ResolveRequirements>(
       return;
     }
 
-    yield* output.raw(`Deleted Function ${flags.slug} from project ${projectRef}.\n`);
+    const style = dependencies.styleIdentifier ?? ((text: string) => text);
+    yield* output.raw(`Deleted Function ${style(flags.slug)} from project ${style(projectRef)}.\n`);
   }).pipe(Effect.withSpan("functions.delete"));
 }

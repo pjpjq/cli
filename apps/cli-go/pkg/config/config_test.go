@@ -285,56 +285,138 @@ enabled = false
 		require.NotNil(t, config.Experimental.PgDelta)
 		assert.False(t, config.Experimental.PgDelta.Enabled)
 	})
-}
 
-func TestPgDeltaNpmVersionPinning(t *testing.T) {
-	t.Run("defaults when pgdelta-version file missing", func(t *testing.T) {
-		c := NewConfig()
-		require.NoError(t, c.Load("", fs.MapFS{}))
-		require.NotNil(t, c.Experimental.PgDelta)
-		assert.Equal(t, DefaultPgDeltaNpmVersion, c.Experimental.PgDelta.NpmVersion)
-		assert.Equal(t, DefaultPgDeltaNpmVersion, EffectivePgDeltaNpmVersion(Config(&c)))
-	})
-
-	t.Run("EffectivePgDeltaNpmVersion nil config uses default", func(t *testing.T) {
-		assert.Equal(t, DefaultPgDeltaNpmVersion, EffectivePgDeltaNpmVersion(nil))
-	})
-
-	t.Run("reads trimmed version from supabase/.temp/pgdelta-version", func(t *testing.T) {
-		c := NewConfig()
+	// [compute] is owned by the TS CLI, but the published JSON schema advertises it,
+	// so a user can hand-write it today. Every Go-delegated path goes through
+	// config.Load, and UnmarshalExact rejects keys baseConfig does not model — so the
+	// section has to at least parse here, in both base and remote position.
+	t.Run("accepts the TS-owned compute section", func(t *testing.T) {
+		config := NewConfig()
 		fsys := fs.MapFS{
 			"supabase/config.toml": &fs.MapFile{Data: []byte(`
-[experimental.pgdelta]
-enabled = true
+project_id = "test"
+
+[compute.api]
+runtime = "node"
+
+[remotes.prod]
+project_id = "bvikqvbczudanvggcord"
+
+[remotes.prod.compute.api]
+instances = 3
 `)},
-			"supabase/.temp/pgdelta-version": &fs.MapFile{Data: []byte("  9.9.9-test  \n")},
 		}
-		require.NoError(t, c.Load("", fsys))
-		require.NotNil(t, c.Experimental.PgDelta)
-		assert.Equal(t, "9.9.9-test", c.Experimental.PgDelta.NpmVersion)
-		assert.Equal(t, "9.9.9-test", EffectivePgDeltaNpmVersion(Config(&c)))
+
+		assert.NoError(t, config.Load("", fsys))
 	})
 
-	t.Run("whitespace-only pgdelta-version keeps default", func(t *testing.T) {
-		c := NewConfig()
-		fsys := fs.MapFS{
-			"supabase/config.toml": &fs.MapFile{Data: []byte(`
-[experimental.pgdelta]
-enabled = true
-`)},
-			"supabase/.temp/pgdelta-version": &fs.MapFile{Data: []byte("   \n")},
-		}
-		require.NoError(t, c.Load("", fsys))
-		require.NotNil(t, c.Experimental.PgDelta)
-		assert.Equal(t, DefaultPgDeltaNpmVersion, c.Experimental.PgDelta.NpmVersion)
-	})
+	for _, tt := range []struct {
+		name       string
+		configData string
+		projectID  string
+		want       bool
+	}{
+		{
+			name:       "base true",
+			configData: "[experimental]\nstack = true\n",
+			want:       true,
+		},
+		{
+			name:       "base false",
+			configData: "[experimental]\nstack = false\n",
+			want:       false,
+		},
+		{
+			name:       "remote true",
+			configData: "[remotes.prod]\nproject_id = \"abcdefghijklmnopqrst\"\n[remotes.prod.experimental]\nstack = true\n",
+			projectID:  "abcdefghijklmnopqrst",
+			want:       true,
+		},
+		{
+			name:       "remote false",
+			configData: "[remotes.prod]\nproject_id = \"abcdefghijklmnopqrst\"\n[remotes.prod.experimental]\nstack = false\n",
+			projectID:  "abcdefghijklmnopqrst",
+			want:       false,
+		},
+	} {
+		t.Run("accepts experimental stack "+tt.name, func(t *testing.T) {
+			t.Setenv("SUPABASE_EXPERIMENTAL_STACK", "")
+			config := NewConfig()
+			config.ProjectId = tt.projectID
+			fsys := fs.MapFS{
+				"supabase/config.toml": &fs.MapFile{Data: []byte(tt.configData)},
+			}
 
-	t.Run("InterpolatePgDeltaScript substitutes placeholder", func(t *testing.T) {
-		c := NewConfig()
-		require.NoError(t, c.Load("", fs.MapFS{}))
-		// Embedded TS pins use this semver literal before InterpolatePgDeltaScript runs.
-		got := InterpolatePgDeltaScript(Config(&c), `from "npm:@supabase/pg-delta@1.0.0-alpha.20";`)
-		assert.Equal(t, `from "npm:@supabase/pg-delta@`+DefaultPgDeltaNpmVersion+`";`, got)
+			require.NoError(t, config.Load("", fsys))
+			assert.Equal(t, tt.want, config.Experimental.Stack)
+		})
+	}
+
+	for _, tt := range []struct {
+		name       string
+		configData string
+		projectID  string
+		want       bool
+	}{
+		{
+			name:       "base true",
+			configData: "[experimental]\ncompute = true\n",
+			want:       true,
+		},
+		{
+			name:       "base false",
+			configData: "[experimental]\ncompute = false\n",
+			want:       false,
+		},
+		{
+			name:       "remote true",
+			configData: "[remotes.prod]\nproject_id = \"abcdefghijklmnopqrst\"\n[remotes.prod.experimental]\ncompute = true\n",
+			projectID:  "abcdefghijklmnopqrst",
+			want:       true,
+		},
+		{
+			name:       "remote false",
+			configData: "[remotes.prod]\nproject_id = \"abcdefghijklmnopqrst\"\n[remotes.prod.experimental]\ncompute = false\n",
+			projectID:  "abcdefghijklmnopqrst",
+			want:       false,
+		},
+	} {
+		t.Run("accepts experimental compute "+tt.name, func(t *testing.T) {
+			t.Setenv("SUPABASE_EXPERIMENTAL_COMPUTE", "")
+			config := NewConfig()
+			config.ProjectId = tt.projectID
+			fsys := fs.MapFS{
+				"supabase/config.toml": &fs.MapFile{Data: []byte(tt.configData)},
+			}
+
+			require.NoError(t, config.Load("", fsys))
+			assert.Equal(t, tt.want, config.Experimental.Compute)
+		})
+	}
+
+	t.Run("does not emit experimental stack or compute", func(t *testing.T) {
+		config := NewConfig()
+		config.Experimental.Stack = true
+		config.Experimental.Compute = true
+
+		encodedToml, err := ToTomlBytes(config.Experimental)
+		require.NoError(t, err)
+		var encoded map[string]any
+		_, err = toml.Decode(string(encodedToml), &encoded)
+		require.NoError(t, err)
+		assert.NotContains(t, encoded, "stack")
+		assert.NotContains(t, encoded, "compute")
+
+		var buf bytes.Buffer
+		require.NoError(t, config.Eject(&buf))
+		var rendered map[string]any
+		_, err = toml.Decode(buf.String(), &rendered)
+		require.NoError(t, err)
+		experimental, ok := rendered["experimental"].(map[string]any)
+		if assert.True(t, ok) {
+			assert.NotContains(t, experimental, "stack")
+			assert.NotContains(t, experimental, "compute")
+		}
 	})
 }
 
@@ -344,8 +426,12 @@ func TestRemoteOverride(t *testing.T) {
 		config.ProjectId = "bvikqvbczudanvggcord"
 		// Setup in-memory fs
 		fsys := fs.MapFS{
-			"supabase/config.toml":           &fs.MapFile{Data: testInitConfigEmbed},
-			"supabase/templates/invite.html": &fs.MapFile{},
+			"supabase/config.toml":                                  &fs.MapFile{Data: testInitConfigEmbed},
+			"supabase/templates/invite.html":                        &fs.MapFile{},
+			"supabase/templates/password_changed_notification.html": &fs.MapFile{},
+			"certs/my-cert.pem":                                     &fs.MapFile{},
+			"certs/my-key.pem":                                      &fs.MapFile{},
+			"supabase/signing_keys.json":                            &fs.MapFile{Data: []byte("[]")},
 		}
 		// Run test
 		t.Setenv("SUPABASE_AUTH_SITE_URL", "http://preview.com")
@@ -362,8 +448,12 @@ func TestRemoteOverride(t *testing.T) {
 		config.ProjectId = "vpefcjyosynxeiebfscx"
 		// Setup in-memory fs
 		fsys := fs.MapFS{
-			"supabase/config.toml":           &fs.MapFile{Data: testInitConfigEmbed},
-			"supabase/templates/invite.html": &fs.MapFile{},
+			"supabase/config.toml":                                  &fs.MapFile{Data: testInitConfigEmbed},
+			"supabase/templates/invite.html":                        &fs.MapFile{},
+			"supabase/templates/password_changed_notification.html": &fs.MapFile{},
+			"certs/my-cert.pem":                                     &fs.MapFile{},
+			"certs/my-key.pem":                                      &fs.MapFile{},
+			"supabase/signing_keys.json":                            &fs.MapFile{Data: []byte("[]")},
 		}
 		// Run test
 		t.Setenv("SUPABASE_AUTH_SITE_URL", "http://preview.com")
@@ -380,8 +470,12 @@ func TestRemoteOverride(t *testing.T) {
 		config := NewConfig()
 		// Setup in-memory fs
 		fsys := fs.MapFS{
-			"supabase/config.toml":           &fs.MapFile{Data: testInitConfigEmbed},
-			"supabase/templates/invite.html": &fs.MapFile{},
+			"supabase/config.toml":                                  &fs.MapFile{Data: testInitConfigEmbed},
+			"supabase/templates/invite.html":                        &fs.MapFile{},
+			"supabase/templates/password_changed_notification.html": &fs.MapFile{},
+			"certs/my-cert.pem":                                     &fs.MapFile{},
+			"certs/my-key.pem":                                      &fs.MapFile{},
+			"supabase/signing_keys.json":                            &fs.MapFile{Data: []byte("[]")},
 		}
 		// Run test
 		t.Setenv("TWILIO_AUTH_TOKEN", "token")
@@ -675,6 +769,78 @@ func TestGlobFiles(t *testing.T) {
 		assert.ErrorContains(t, err, "no files matched")
 		// Validate files
 		assert.Empty(t, files)
+	})
+
+	t.Run("skips empty globs when configured", func(t *testing.T) {
+		fsys := fs.MapFS{
+			"supabase/schemas/tables/players.sql": &fs.MapFile{},
+		}
+		g := Glob{
+			"supabase/schemas/tables/*.sql",
+			"supabase/schemas/materialized_views/*.sql",
+		}
+
+		files, err := g.Files(fsys, WithSkipEmptyGlobs())
+
+		assert.NoError(t, err)
+		assert.Equal(t, []string{"supabase/schemas/tables/players.sql"}, files)
+	})
+
+	t.Run("errors when all skipped globs are empty and configured to fail", func(t *testing.T) {
+		fsys := fs.MapFS{}
+		g := Glob{
+			"supabase/schemas/tables/*.sql",
+			"supabase/schemas/materialized_views/*.sql",
+		}
+
+		files, err := g.Files(fsys, WithSkipEmptyGlobs(), WithErrorOnAllSkippedGlobs())
+
+		assert.ErrorContains(t, err, "no files matched pattern")
+		assert.Empty(t, files)
+	})
+}
+
+func TestGlobSQLFiles(t *testing.T) {
+	t.Run("expands directory entries in declared order", func(t *testing.T) {
+		fsys := fs.MapFS{
+			"supabase/schemas/z_function.sql":            &fs.MapFile{Data: []byte("select 1;")},
+			"supabase/schemas/tables/a_table.sql":        &fs.MapFile{Data: []byte("select 2;")},
+			"supabase/schemas/tables/nested/b_table.sql": &fs.MapFile{Data: []byte("select 3;")},
+			"supabase/schemas/tables/readme.md":          &fs.MapFile{Data: []byte("ignored")},
+		}
+		g := Glob{
+			"supabase/schemas/z_function.sql",
+			"supabase/schemas/tables",
+		}
+
+		files, err := g.SQLFiles(fsys)
+
+		assert.NoError(t, err)
+		assert.Equal(t, []string{
+			"supabase/schemas/z_function.sql",
+			"supabase/schemas/tables/a_table.sql",
+			"supabase/schemas/tables/nested/b_table.sql",
+		}, files)
+	})
+
+	t.Run("deduplicates explicit files and directory matches", func(t *testing.T) {
+		fsys := fs.MapFS{
+			"supabase/database/a.sql": &fs.MapFile{Data: []byte("select 1;")},
+			"supabase/database/b.sql": &fs.MapFile{Data: []byte("select 2;")},
+		}
+		g := Glob{
+			"supabase/database/a.sql",
+			"supabase/database",
+			"supabase/database/*.sql",
+		}
+
+		files, err := g.SQLFiles(fsys)
+
+		assert.NoError(t, err)
+		assert.Equal(t, []string{
+			"supabase/database/a.sql",
+			"supabase/database/b.sql",
+		}, files)
 	})
 }
 

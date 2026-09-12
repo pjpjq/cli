@@ -24,6 +24,7 @@ import (
 	"github.com/supabase/cli/internal/testing/helper"
 	"github.com/supabase/cli/internal/utils"
 	"github.com/supabase/cli/internal/utils/flags"
+	pkgconfig "github.com/supabase/cli/pkg/config"
 	"github.com/supabase/cli/pkg/migration"
 	"github.com/supabase/cli/pkg/pgtest"
 )
@@ -34,6 +35,51 @@ var dbConfig = pgconn.Config{
 	User:     "admin",
 	Password: "password",
 	Database: "postgres",
+}
+
+func TestLoadDeclaredSchemas(t *testing.T) {
+	t.Run("respects schema_paths order when pg-delta declarative dir exists", func(t *testing.T) {
+		originalConfig := utils.Config
+		t.Cleanup(func() { utils.Config = originalConfig })
+		utils.Config.Db.Migrations.SchemaPaths = pkgconfig.Glob{
+			"supabase/schemas/z_function.sql",
+			"supabase/schemas/a_table.sql",
+		}
+		utils.Config.Experimental.PgDelta = &pkgconfig.PgDeltaConfig{
+			Enabled:               true,
+			DeclarativeSchemaPath: utils.SchemasDir,
+		}
+		fsys := afero.NewMemMapFs()
+		require.NoError(t, fsys.MkdirAll(utils.SchemasDir, 0755))
+		require.NoError(t, afero.WriteFile(fsys, "supabase/schemas/a_table.sql", []byte("create table a();"), 0644))
+		require.NoError(t, afero.WriteFile(fsys, "supabase/schemas/z_function.sql", []byte("create function z() returns void language sql as $$ select 1 $$;"), 0644))
+
+		declared, err := loadDeclaredSchemas(fsys)
+
+		require.NoError(t, err)
+		assert.Equal(t, []string{
+			"supabase/schemas/z_function.sql",
+			"supabase/schemas/a_table.sql",
+		}, declared)
+	})
+
+	t.Run("expands schema_paths directory entries deterministically", func(t *testing.T) {
+		originalConfig := utils.Config
+		t.Cleanup(func() { utils.Config = originalConfig })
+		utils.Config.Db.Migrations.SchemaPaths = pkgconfig.Glob{utils.DeclarativeDir}
+		fsys := afero.NewMemMapFs()
+		require.NoError(t, fsys.MkdirAll(filepath.Join(utils.DeclarativeDir, "nested"), 0755))
+		require.NoError(t, afero.WriteFile(fsys, filepath.Join(utils.DeclarativeDir, "nested", "b.sql"), []byte("select 2;"), 0644))
+		require.NoError(t, afero.WriteFile(fsys, filepath.Join(utils.DeclarativeDir, "a.sql"), []byte("select 1;"), 0644))
+
+		declared, err := loadDeclaredSchemas(fsys)
+
+		require.NoError(t, err)
+		assert.Equal(t, []string{
+			filepath.Join(utils.DeclarativeDir, "a.sql"),
+			filepath.Join(utils.DeclarativeDir, "nested", "b.sql"),
+		}, declared)
+	})
 }
 
 func TestRun(t *testing.T) {
@@ -74,7 +120,7 @@ func TestRun(t *testing.T) {
 			Reply("CREATE DATABASE")
 		defer conn.Close(t)
 		// Run test
-		err := Run(context.Background(), []string{"public"}, "file", dbConfig, DiffSchemaMigra, false, fsys, func(cc *pgx.ConnConfig) {
+		err := Run(context.Background(), []string{"public"}, "file", dbConfig, DiffSchemaMigra, fsys, func(cc *pgx.ConnConfig) {
 			if cc.Host == dbConfig.Host {
 				// Fake a SSL error when connecting to target database
 				cc.LookupFunc = func(ctx context.Context, host string) (addrs []string, err error) {
@@ -108,7 +154,7 @@ func TestRun(t *testing.T) {
 			Get("/v" + utils.Docker.ClientVersion() + "/images/" + utils.GetRegistryImageUrl(utils.Config.Db.Image) + "/json").
 			ReplyError(errors.New("network error"))
 		// Run test
-		err := Run(context.Background(), []string{"public"}, "file", dbConfig, DiffSchemaMigra, false, fsys)
+		err := Run(context.Background(), []string{"public"}, "file", dbConfig, DiffSchemaMigra, fsys)
 		// Check error
 		assert.ErrorContains(t, err, "network error")
 		assert.Empty(t, apitest.ListUnmatchedRequests())
@@ -250,7 +296,7 @@ func TestDiffDatabase(t *testing.T) {
 			Get("/v" + utils.Docker.ClientVersion() + "/images/" + utils.GetRegistryImageUrl(utils.Config.Db.Image) + "/json").
 			ReplyError(errNetwork)
 		// Run test
-		result, err := DiffDatabase(context.Background(), []string{"public"}, dbConfig, io.Discard, fsys, DiffSchemaMigra, false)
+		result, err := DiffDatabase(context.Background(), []string{"public"}, dbConfig, io.Discard, fsys, DiffSchemaMigra)
 		// Check error
 		assert.Empty(t, result)
 		assert.ErrorIs(t, err, errNetwork)
@@ -281,7 +327,7 @@ func TestDiffDatabase(t *testing.T) {
 			Delete("/v" + utils.Docker.ClientVersion() + "/containers/test-shadow-db").
 			Reply(http.StatusOK)
 		// Run test
-		result, err := DiffDatabase(context.Background(), []string{"public"}, dbConfig, io.Discard, fsys, DiffSchemaMigra, false)
+		result, err := DiffDatabase(context.Background(), []string{"public"}, dbConfig, io.Discard, fsys, DiffSchemaMigra)
 		// Check error
 		assert.Empty(t, result)
 		assert.ErrorContains(t, err, "test-shadow-db container is not running: exited")
@@ -313,7 +359,7 @@ func TestDiffDatabase(t *testing.T) {
 		conn.Query(utils.GlobalsSql).
 			ReplyError(pgerrcode.DuplicateSchema, `schema "public" already exists`)
 		// Run test
-		result, err := DiffDatabase(context.Background(), []string{"public"}, dbConfig, io.Discard, fsys, DiffSchemaMigra, false, conn.Intercept)
+		result, err := DiffDatabase(context.Background(), []string{"public"}, dbConfig, io.Discard, fsys, DiffSchemaMigra, conn.Intercept)
 		// Check error
 		assert.Empty(t, result)
 		assert.ErrorContains(t, err, `ERROR: schema "public" already exists (SQLSTATE 42P06)
@@ -345,6 +391,16 @@ create schema public`)
 			Delete("/v" + utils.Docker.ClientVersion() + "/containers/test-shadow-db").
 			Reply(http.StatusOK)
 		apitest.MockDockerStart(utils.Docker, utils.GetRegistryImageUrl(utils.Config.EdgeRuntime.Image), "test-migra")
+		// The edge-runtime diff waits for the container to exit via inspect before
+		// reading its logs (it must not follow the log stream — that hangs under
+		// podman, supabase/pg-toolbelt#312), so the diff failure here surfaces from
+		// the log read rather than the followed stream.
+		gock.New(utils.Docker.DaemonHost()).
+			Get("/v" + utils.Docker.ClientVersion() + "/containers/test-migra/json").
+			Reply(http.StatusOK).
+			JSON(container.InspectResponse{ContainerJSONBase: &container.ContainerJSONBase{
+				State: &container.State{ExitCode: 0},
+			}})
 		gock.New(utils.Docker.DaemonHost()).
 			Get("/v" + utils.Docker.ClientVersion() + "/containers/test-migra/logs").
 			ReplyError(errors.New("network error"))
@@ -369,7 +425,7 @@ create schema public`)
 			Query(migration.INSERT_MIGRATION_VERSION, "0", "test", []string{sql}).
 			Reply("INSERT 0 1")
 		// Run test
-		result, err := DiffDatabase(context.Background(), []string{"public"}, dbConfig, io.Discard, fsys, DiffSchemaMigra, false, func(cc *pgx.ConnConfig) {
+		result, err := DiffDatabase(context.Background(), []string{"public"}, dbConfig, io.Discard, fsys, DiffSchemaMigra, func(cc *pgx.ConnConfig) {
 			if cc.Host == dbConfig.Host {
 				// Fake a SSL error when connecting to target database
 				cc.LookupFunc = func(ctx context.Context, host string) (addrs []string, err error) {
@@ -408,4 +464,53 @@ func TestLoadSchemas(t *testing.T) {
 	// Check error
 	assert.NoError(t, err)
 	assert.ElementsMatch(t, expected, schemas)
+}
+
+func TestLoadSchemasSkipsEmptySchemaPathGlobs(t *testing.T) {
+	fsys := afero.NewMemMapFs()
+	matched := filepath.Join(utils.SupabaseDirPath, "schemas", "tables", "players.sql")
+	require.NoError(t, afero.WriteFile(fsys, matched, nil, 0644))
+	utils.Config.Db.Migrations.SchemaPaths = []string{
+		filepath.Join(utils.SupabaseDirPath, "schemas", "tables", "*.sql"),
+		filepath.Join(utils.SupabaseDirPath, "schemas", "materialized_views", "*.sql"),
+	}
+	t.Cleanup(func() {
+		utils.Config.Db.Migrations.SchemaPaths = nil
+	})
+
+	schemas, err := loadDeclaredSchemas(fsys)
+
+	assert.NoError(t, err)
+	assert.Equal(t, []string{filepath.ToSlash(matched)}, schemas)
+}
+
+func TestLoadSchemasErrorsOnMissingLiteralSchemaPath(t *testing.T) {
+	fsys := afero.NewMemMapFs()
+	utils.Config.Db.Migrations.SchemaPaths = []string{
+		filepath.Join(utils.SupabaseDirPath, "schemas", "tables", "players.sql"),
+	}
+	t.Cleanup(func() {
+		utils.Config.Db.Migrations.SchemaPaths = nil
+	})
+
+	schemas, err := loadDeclaredSchemas(fsys)
+
+	assert.ErrorContains(t, err, "no files matched pattern")
+	assert.Empty(t, schemas)
+}
+
+func TestLoadSchemasErrorsWhenAllSchemaPathGlobsAreEmpty(t *testing.T) {
+	fsys := afero.NewMemMapFs()
+	utils.Config.Db.Migrations.SchemaPaths = []string{
+		filepath.Join(utils.SupabaseDirPath, "schemas", "tables", "*.sql"),
+		filepath.Join(utils.SupabaseDirPath, "schemas", "views", "*.sql"),
+	}
+	t.Cleanup(func() {
+		utils.Config.Db.Migrations.SchemaPaths = nil
+	})
+
+	schemas, err := loadDeclaredSchemas(fsys)
+
+	assert.ErrorContains(t, err, "no files matched pattern")
+	assert.Empty(t, schemas)
 }

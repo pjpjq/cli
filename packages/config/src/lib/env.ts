@@ -1,11 +1,15 @@
 import { Schema, SchemaAST } from "effect";
 
-export const ENV_PATTERN = "^env\\([A-Z_][A-Z0-9_]*\\)$";
-export const ENV_CAPTURE_REGEX = /^env\(([A-Z_][A-Z0-9_]*)\)$/;
+// Matches `env(...)` references case-insensitively on the captured name — e.g.
+// `env(project_id)` is a valid reference, not just SCREAMING_SNAKE_CASE names.
+export const ENV_PATTERN = "^env\\((.*)\\)$";
+export const ENV_CAPTURE_REGEX = /^env\((.*)\)$/;
+// Stricter matcher used when `goViperCompat` is off: only SCREAMING_SNAKE_CASE names match.
+export const ENV_CAPTURE_REGEX_STRICT = /^env\(([A-Z_][A-Z0-9_]*)\)$/;
 const envRegex = new RegExp(ENV_PATTERN);
 
-export function isEnvReference(value: string): boolean {
-  return envRegex.test(value);
+export function isEnvReference(value: string, goViperCompat: boolean): boolean {
+  return (goViperCompat ? ENV_CAPTURE_REGEX : ENV_CAPTURE_REGEX_STRICT).test(value);
 }
 
 interface EnvAnnotations extends Schema.Annotations.Documentation<string> {
@@ -13,7 +17,7 @@ interface EnvAnnotations extends Schema.Annotations.Documentation<string> {
 }
 
 // Marker annotation: this field requires the `env(VAR)` literal form and is
-// resolved post-decode via `resolveProjectValue` / `resolveProjectSubtree`.
+// resolved post-decode via `resolveCliConfigValue` / `resolveCliConfigSubtree`.
 // The pre-decode walker honors this and leaves the literal untouched.
 const X_ENV_DEFERRED = "x-env-deferred" as const;
 
@@ -34,30 +38,12 @@ export const secret = (annotations?: SecretAnnotations) =>
     "x-secret": true,
   });
 
-// ---------------------------------------------------------------------------
-// Pre-decode env() interpolation with schema-aware type coercion
-// ---------------------------------------------------------------------------
-//
-// TOML/JSON parsers turn `port = "env(SUPABASE_ANALYTICS_PORT)"` into a string
-// at `analytics.port`, but the schema declares `port: Schema.Number`. Without
-// pre-decode handling the strict decoder rejects the string and crashes
-// `supabase db start` (CLI-1489).
-//
-// `interpolateEnvReferencesAgainstSchema` walks the parsed document and the
-// schema AST in parallel:
-//   - For string leaves matching `env(VAR)`: substitute `env[VAR]` if set, or
-//     preserve the literal verbatim if unset (matches Go's
-//     `apps/cli-go/pkg/config/decode_hooks.go:14-21`).
-//   - After substitution, if the schema at that path expects Number or Boolean
-//     and the value is still a string, coerce it. This mirrors Go's
-//     mapstructure chain where `LoadEnvHook` returns a string and subsequent
-//     hooks convert it to the target type.
-//   - Coercion is only attempted on strings produced by env() substitution.
-//     Pre-existing string literals at non-string paths are left untouched —
-//     they'll surface as schema errors at decode time with their original
-//     value, preserving error clarity.
+type ExpectedType = "number" | "boolean" | "string" | "array" | "unknown";
 
-type ExpectedType = "number" | "boolean" | "string" | "unknown";
+// Accepted boolean string forms, matching Go's `strconv.ParseBool`; duplicated rather than
+// imported so `packages/config` has no dependency on `apps/cli`.
+const GO_BOOL_TRUE = new Set(["1", "t", "T", "TRUE", "true", "True"]);
+const GO_BOOL_FALSE = new Set(["0", "f", "F", "FALSE", "false", "False", ""]);
 
 // Unwrap Suspend (lazy AST refs from recursive schemas). Other transformation
 // wrappers expose the target type via `.ast` directly, so no additional
@@ -69,6 +55,17 @@ function unwrapAst(ast: SchemaAST.AST): SchemaAST.AST {
   return ast;
 }
 
+// A homogeneous `Schema.Array(Schema.String)` compiles to an `Arrays` AST node with no fixed
+// tuple `elements` and a single `rest` spread type; only this shape (not a fixed tuple or a
+// mixed-type array) is eligible for the comma-split coercion below.
+function isHomogeneousStringArray(node: SchemaAST.AST): boolean {
+  if (node._tag !== "Arrays" || node.elements.length !== 0 || node.rest.length !== 1) {
+    return false;
+  }
+  const spread = node.rest[0];
+  return spread !== undefined && unwrapAst(spread)._tag === "String";
+}
+
 function leafExpectedType(ast: SchemaAST.AST): ExpectedType {
   const node = unwrapAst(ast);
   switch (node._tag) {
@@ -78,12 +75,11 @@ function leafExpectedType(ast: SchemaAST.AST): ExpectedType {
       return "boolean";
     case "String":
       return "string";
+    case "Arrays":
+      return isHomogeneousStringArray(node) ? "array" : "unknown";
     case "Union": {
-      // Walk Union branches in declared order; first concrete primitive wins.
-      // For unions like `Schema.Union(Schema.Number, Schema.Null)` this picks
-      // the meaningful side. If the union mixes Number and String we err on
-      // the side of the first match — the schema decode will still validate
-      // membership after coercion.
+      // Walks branches in declared order; the first concrete primitive wins (e.g. `Number` in
+      // `Schema.Union(Schema.Number, Schema.Null)`). Schema decode still validates afterward.
       for (const variant of node.types) {
         const t = leafExpectedType(variant);
         if (t !== "unknown") {
@@ -156,23 +152,34 @@ function coerceLeaf(value: unknown, expected: ExpectedType): unknown {
     return value;
   }
   if (expected === "boolean") {
-    if (value === "true") return true;
-    if (value === "false") return false;
+    if (GO_BOOL_TRUE.has(value)) return true;
+    if (GO_BOOL_FALSE.has(value)) return false;
     return value;
+  }
+  if (expected === "array") {
+    // An empty string decodes to an empty array; otherwise split on `,` with no trimming.
+    return value === "" ? [] : value.split(",");
   }
   return value;
 }
 
-function substituteEnvLeaf(value: string, env: Readonly<Record<string, string>>): string {
-  const match = ENV_CAPTURE_REGEX.exec(value);
+function substituteEnvLeaf(
+  value: string,
+  env: Readonly<Record<string, string>>,
+  goViperCompat: boolean,
+): { readonly value: string; readonly resolved: boolean; readonly envName?: string } {
+  const match = (goViperCompat ? ENV_CAPTURE_REGEX : ENV_CAPTURE_REGEX_STRICT).exec(value);
   if (match === null) {
-    return value;
+    return { value, resolved: false };
   }
   const envName = match[1];
-  if (envName === undefined || !Object.prototype.hasOwnProperty.call(env, envName)) {
-    return value;
+  const resolved = envName === undefined ? undefined : env[envName];
+  // A present-but-empty var (e.g. a dotenv `KEY=` line) preserves the `env(KEY)` literal, same
+  // as an unset key, instead of substituting an empty string.
+  if (envName === undefined || resolved === undefined || resolved === "") {
+    return { value, resolved: false };
   }
-  return env[envName] ?? value;
+  return { value: resolved, resolved: true, envName };
 }
 
 function isDeferredEnvField(ast: SchemaAST.AST): boolean {
@@ -196,19 +203,41 @@ function walk(
   document: unknown,
   env: Readonly<Record<string, string>>,
   ast: SchemaAST.AST | null,
+  goViperCompat: boolean,
+  path: ReadonlyArray<string>,
+  onResolvedEnv:
+    | ((path: ReadonlyArray<string>, envNames: ReadonlyArray<string>) => void)
+    | undefined,
 ): unknown {
   if (Array.isArray(document)) {
-    return document.map((item, index) => {
+    // Element-level resolutions are reported once, at the array's own path —
+    // one array literal may draw on several env vars, so the names collect.
+    const envNames: Array<string> = [];
+    const onResolvedArrayEnv =
+      onResolvedEnv === undefined
+        ? undefined
+        : (_: ReadonlyArray<string>, resolvedNames: ReadonlyArray<string>) => {
+            for (const envName of resolvedNames) {
+              if (!envNames.includes(envName)) {
+                envNames.push(envName);
+              }
+            }
+          };
+    const result = document.map((item, index) => {
       const child = ast === null ? null : descendAst(ast, String(index));
-      return walk(item, env, child);
+      return walk(item, env, child, goViperCompat, [...path, String(index)], onResolvedArrayEnv);
     });
+    if (envNames.length > 0) {
+      onResolvedEnv?.(path, envNames);
+    }
+    return result;
   }
 
   if (typeof document === "object" && document !== null) {
     const result: Record<string, unknown> = {};
     for (const [key, value] of Object.entries(document)) {
       const child = ast === null ? null : descendAst(ast, key);
-      result[key] = walk(value, env, child);
+      result[key] = walk(value, env, child, goViperCompat, [...path, key], onResolvedEnv);
     }
     return result;
   }
@@ -220,41 +249,58 @@ function walk(
     if (ast !== null && isDeferredEnvField(ast)) {
       return document;
     }
-    // Substitute env() then coerce based on the schema's expected type at this
-    // path. Only the substituted form is fed to coercion — literal strings at
-    // non-string paths are left untouched so the decoder can report them with
-    // their original value.
-    const substituted = substituteEnvLeaf(document, env);
+
+    const interpolation = substituteEnvLeaf(document, env, goViperCompat);
+    const substituted = interpolation.value;
+    if (interpolation.resolved && interpolation.envName !== undefined) {
+      onResolvedEnv?.(path, [interpolation.envName]);
+    }
+    const expected = ast === null ? "unknown" : leafExpectedType(ast);
+
+    // Unlike number/boolean coercion, array coercion also applies to literal strings that never
+    // went through env() substitution (e.g. plain TOML `"a,b"`). Gated by `goViperCompat`: off
+    // leaves strings unsplit, so an array-typed field fed a string fails decode instead of coercing.
+    if (expected === "array") {
+      return goViperCompat ? coerceLeaf(substituted, expected) : substituted;
+    }
+
+    // Only the substituted form is fed to coercion; literal strings at non-string paths are
+    // left untouched so the decoder reports them with their original value.
     if (substituted === document) {
       return document;
     }
     if (ast === null) {
       return substituted;
     }
-    return coerceLeaf(substituted, leafExpectedType(ast));
+    return coerceLeaf(substituted, expected);
   }
 
   return document;
 }
 
 /**
- * Pre-decode env() substitution + schema-aware coercion.
- *
- * Walks the raw parsed document and the schema AST in parallel. For every
- * string leaf matching `env(VAR)`:
- *   1. Substitutes `env[VAR]` if set, else preserves the literal verbatim
- *      (Go-parity with `apps/cli-go/pkg/config/decode_hooks.go:14-21`).
- *   2. If the schema at that path expects Number or Boolean, coerces the
- *      substituted string to the expected primitive — mirroring Go's
- *      mapstructure chain where `LoadEnvHook` returns a string that the next
- *      hook converts to the target type.
- *
- * Returns a new structure; does not mutate the input.
+ * Substitutes `env(VAR)` references against `env` and coerces the result to the schema's
+ * expected primitive type at each path. A set-but-empty variable leaves the literal untouched,
+ * same as an unset one. Returns a new structure; does not mutate the input.
  */
 export function interpolateEnvReferencesAgainstSchema(
   document: unknown,
   env: Readonly<Record<string, string>>,
   schema: { readonly ast: SchemaAST.AST },
+  options?: {
+    readonly goViperCompat?: boolean;
+    /** Fires per resolved leaf with the substituting env vars' names (array
+     * leaves report once at the array path, collecting every element's
+     * variable — one array literal may draw on several). */
+    readonly onResolvedEnv?: (path: ReadonlyArray<string>, envNames: ReadonlyArray<string>) => void;
+  },
 ): unknown {
-  return walk(document, env, schema.ast);
+  return walk(
+    document,
+    env,
+    schema.ast,
+    options?.goViperCompat ?? false,
+    [],
+    options?.onResolvedEnv,
+  );
 }

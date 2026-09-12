@@ -26,17 +26,6 @@ func ToPostgresURL(config pgconn.Config) string {
 	return toPostgresURL(config, url.UserPassword(config.User, config.Password))
 }
 
-// ToPostgresURLWithoutPassword renders the connection URL exactly like
-// ToPostgresURL but omits the password from the userinfo. Use it for callers that
-// print the URL to stdout (the hidden `db __shadow` seam): embedding the password
-// there is clear-text logging of a credential (CWE-312, flagged by CodeQL). The
-// password is never the seam's to share — the TS caller that consumes the seam
-// output re-injects the local Postgres password it already resolves from
-// config.toml (`utils.Config.Db.Password`).
-func ToPostgresURLWithoutPassword(config pgconn.Config) string {
-	return toPostgresURL(config, url.User(config.User))
-}
-
 func toPostgresURL(config pgconn.Config, userinfo *url.Userinfo) string {
 	timeoutSecond := int64(config.ConnectTimeout.Seconds())
 	if timeoutSecond == 0 {
@@ -63,8 +52,8 @@ func toPostgresURL(config pgconn.Config, userinfo *url.Userinfo) string {
 
 var ErrPrimaryNotFound = errors.New("primary database not found")
 
-func GetPoolerConfigPrimary(ctx context.Context, ref string) (api.SupavisorConfigResponse, error) {
-	var result api.SupavisorConfigResponse
+func GetPoolerConfigPrimary(ctx context.Context, ref string) (api.SupavisorConfigResponseOutput, error) {
+	var result api.SupavisorConfigResponseOutput
 	resp, err := GetSupabase().V1GetPoolerConfigWithResponse(ctx, ref)
 	if err != nil {
 		return result, errors.Errorf("failed to get pooler: %w", err)
@@ -72,7 +61,7 @@ func GetPoolerConfigPrimary(ctx context.Context, ref string) (api.SupavisorConfi
 		return result, errors.Errorf("unexpected get pooler status %d: %s", resp.StatusCode(), string(resp.Body))
 	}
 	for _, config := range *resp.JSON200 {
-		if config.DatabaseType == api.SupavisorConfigResponseDatabaseTypePRIMARY {
+		if config.DatabaseType == api.SupavisorConfigResponseOutputDatabaseTypePRIMARY {
 			return config, nil
 		}
 	}
@@ -321,8 +310,6 @@ func SetConnectSuggestion(err error) {
 			"Make sure your local IP is allowed in Network Restrictions and Network Bans.\n%s/project/_/database/settings",
 			CurrentProfile.DashboardURL,
 		)
-	} else if strings.Contains(msg, "SSL connection is required") && viper.GetBool("DEBUG") {
-		CmdSuggestion = "SSL connection is not supported with --debug flag"
 	} else if strings.Contains(msg, "SCRAM exchange: Wrong password") || strings.Contains(msg, "failed SASL auth") {
 		// password authentication failed for user / invalid SCRAM server-final-message received from server
 		CmdSuggestion = SuggestEnvVar
@@ -346,7 +333,9 @@ func ConnectByConfigStream(ctx context.Context, config pgconn.Config, w io.Write
 		return ConnectLocalPostgres(ctx, config, options...)
 	}
 	fmt.Fprintln(w, "Connecting to remote database...")
-	opts := append(options, func(cc *pgx.ConnConfig) {
+	// Ahead of the caller's overrides so they still win, e.g. pgtest clearing TLS.
+	opts := append([]func(*pgx.ConnConfig){preserveTLSConfig(config)}, options...)
+	opts = append(opts, func(cc *pgx.ConnConfig) {
 		if DNSResolver.Value == DNS_OVER_HTTPS {
 			cc.LookupFunc = FallbackLookupIP
 		}
@@ -359,6 +348,33 @@ func ConnectByConfigStream(ctx context.Context, config pgconn.Config, w io.Write
 		}
 	})
 	return ConnectByUrl(ctx, ToPostgresURL(config), opts...)
+}
+
+// preserveTLSConfig replays the TLS state pgconn resolved from sslmode, which
+// ToPostgresURL cannot serialize (it lives in TLSConfig/Fallbacks, not
+// RuntimeParams) so the rebuilt URL re-resolves it from PGSSLMODE and libpq's
+// "prefer" default. Nil Fallbacks, which ParseConfig never produces, marks a
+// config assembled in code with no preference to replay.
+func preserveTLSConfig(config pgconn.Config) func(*pgx.ConnConfig) {
+	return func(cc *pgx.ConnConfig) {
+		if config.Fallbacks == nil {
+			return
+		}
+		cc.TLSConfig = config.TLSConfig
+		// Rebuild against the URL's endpoint: callers may override the port
+		// (GetPoolerConfig pins 5432), and extra HA hosts are dropped anyway.
+		cc.Fallbacks = nil
+		for _, fb := range config.Fallbacks {
+			if fb.Host != config.Host {
+				break
+			}
+			cc.Fallbacks = append(cc.Fallbacks, &pgconn.FallbackConfig{
+				Host:      cc.Host,
+				Port:      cc.Port,
+				TLSConfig: fb.TLSConfig,
+			})
+		}
+	}
 }
 
 func ConnectByConfig(ctx context.Context, config pgconn.Config, options ...func(*pgx.ConnConfig)) (*pgx.Conn, error) {

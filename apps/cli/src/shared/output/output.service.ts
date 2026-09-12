@@ -4,7 +4,7 @@ import { Context } from "effect";
 import type { NonInteractiveError } from "./errors.ts";
 import type { OutputFormat, StreamEvent } from "./types.ts";
 
-interface OutputTask {
+export interface OutputTask {
   readonly message: (message: string) => Effect.Effect<void>;
   readonly succeed: (message?: string) => Effect.Effect<void>;
   readonly fail: (message?: string) => Effect.Effect<void>;
@@ -24,6 +24,13 @@ interface OutputSelectBehavior {
   readonly autocompleteThreshold?: number;
   readonly placeholder?: string;
   readonly maxItems?: number;
+  /**
+   * Which stream the interactive picker renders to. Defaults to `"stdout"`
+   * (clack's default). Pass `"stderr"` when the command's own stdout is a
+   * machine-readable payload even in text mode (e.g. `gen bearer-jwt`'s
+   * signed token).
+   */
+  readonly stream?: "stdout" | "stderr";
 }
 
 /**
@@ -70,6 +77,13 @@ interface OutputShape {
     readonly message: (msg: string) => Effect.Effect<void>;
     readonly stop: (msg: string) => Effect.Effect<void>;
   }>;
+  /**
+   * Emits a successful result without adding a human-readable message.
+   *
+   * JSON mode writes `data` directly, while stream-json mode wraps it in the
+   * standard timestamped result event. Text mode leaves rendering to the caller.
+   */
+  readonly result: (data: unknown) => Effect.Effect<void>;
   readonly success: (message: string, data?: Record<string, unknown>) => Effect.Effect<void>;
   readonly fail: (err: {
     readonly code: string;
@@ -80,9 +94,10 @@ interface OutputShape {
   /**
    * Writes a raw chunk to stdout or stderr without framing.
    *
-   * Reserved for byte-exact parity output (legacy Go-format encoders, Glamour-styled tables)
-   * where structured framing would change the bytes on the wire. Routes through the active
-   * output layer so tests can capture it without monkey-patching `process.stdout` / `process.stderr`.
+   * Reserved for byte-exact output (machine-format encoders, Glamour-styled
+   * tables) where structured framing would change the bytes on the wire.
+   * Routes through the active output layer so tests can capture it without
+   * monkey-patching `process.stdout`/`process.stderr`.
    */
   readonly raw: (text: string, stream?: "stdout" | "stderr") => Effect.Effect<void>;
   /**
